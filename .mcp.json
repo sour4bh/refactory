@@ -2,8 +2,8 @@
   "mcpServers": {
     "refactory": {
       "command": "python",
-      "args": ["/Users/sour4bh/dev/refactory/server/main.py"],
-      "cwd": "/Users/sour4bh/dev/refactory/server"
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/main.py"],
+      "cwd": "${CLAUDE_PLUGIN_ROOT}/server"
     }
   }
 }
