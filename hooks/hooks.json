@@ -1,13 +1,16 @@
 {
-  "SessionStart": [
-    {
-      "hooks": [
-        {
-          "type": "command",
-          "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/install-deps.sh",
-          "timeout": 120
-        }
-      ]
-    }
-  ]
+  "description": "SessionStart hook that installs refactory's Python and Node dependencies on first use.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/install-deps.sh\"",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
 }
