@@ -4,7 +4,11 @@ version = "1.1.0"
 description = "Token-efficient codebase refactoring plugin for Claude Code"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp>=1.0.0",
+    # Capped deliberately: mcp 2.0 removed the Server.list_tools()/call_tool()
+    # decorator API this server is built on. An open ">=1.0.0" floor let a
+    # fresh install pull 2.0 and crash the server on import. Lifting the cap
+    # means porting server/main.py to the 2.x API first.
+    "mcp>=1.0.0,<2",
     "rope>=1.13.0",
 ]
 

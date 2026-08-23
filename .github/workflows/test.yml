@@ -24,7 +24,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
-      - run: pip install rope mcp pytest pytest-asyncio ruff==0.15.20
+      - run: pip install "mcp<2" rope pytest pytest-asyncio ruff==0.15.20
       - run: npm install
         working-directory: server/tsmorph
       - run: ruff check server tests
