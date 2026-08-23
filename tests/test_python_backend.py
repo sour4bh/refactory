@@ -213,9 +213,10 @@ class TestMoveSymbol:
             dry_run=False,
         )
 
-        # Check that main.py imports from new location
+        # main.py must import from the new location, and the old import must be gone
         main_content = (temp_python_project / "src" / "main.py").read_text()
-        assert "from src.helpers import" in main_content or "HelperClass" in main_content
+        assert "from src.helpers import HelperClass" in main_content
+        assert "from src.utils import helper_func, HelperClass" not in main_content
 
     def test_move_symbol_dry_run(self, python_backend, temp_python_project):
         """Dry run should not modify files."""
