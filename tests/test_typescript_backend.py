@@ -1064,3 +1064,160 @@ class TestMoveModuleFailureSafety:
 
         assert (dir_target / "keep.txt").read_text() == "keep"
         assert (temp_typescript_project / "src" / "db.ts").exists()
+
+
+class TestTransactionalWrites:
+    """Mutating operations stage every write before touching any real file."""
+
+    def test_failed_write_changes_nothing(self, typescript_backend, temp_typescript_project):
+        """When staging fails (read-only directory), no file may change.
+
+        This exercises the stage phase of the two-phase commit; a mid-commit
+        rename failure in the same directory cannot be injected separately
+        because both phases depend on the same directory permission.
+        """
+        src_dir = temp_typescript_project / "src"
+        before = {path: path.read_bytes() for path in sorted(src_dir.rglob("*.ts"))}
+        src_dir.chmod(0o555)
+        try:
+            with pytest.raises(Exception, match="without changing any file"):
+                typescript_backend.rename_symbol(
+                    file="src/utils.ts",
+                    old_name="helperFunc",
+                    new_name="helperFn",
+                    project_root=str(temp_typescript_project),
+                    dry_run=False,
+                )
+        finally:
+            src_dir.chmod(0o755)
+
+        after = {path: path.read_bytes() for path in sorted(src_dir.rglob("*.ts"))}
+        assert after == before
+
+    def test_rename_does_not_write_generated_directories(self, typescript_backend, tmp_path):
+        """A broad tsconfig include must not let a rename rewrite build output."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["**/*.ts"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "utils.ts").write_text(
+            'export function helperFunc(): string {\n    return "helped";\n}\n'
+        )
+        (project / "src" / "main.ts").write_text(
+            'import { helperFunc } from "./utils";\nexport const value = helperFunc();\n'
+        )
+        (project / "dist").mkdir()
+        (project / "dist" / "consumer.ts").write_text(
+            'import { helperFunc } from "../src/utils";\nexport const copy = helperFunc();\n'
+        )
+        generated = (project / "dist" / "consumer.ts").read_text()
+
+        result = typescript_backend.rename_symbol(
+            file="src/utils.ts",
+            old_name="helperFunc",
+            new_name="helperFn",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert (project / "dist" / "consumer.ts").read_text() == generated
+        assert "dist/consumer.ts" not in result["affected_files"]
+        assert "helperFn" in (project / "src" / "main.ts").read_text()
+
+    def test_dry_run_reports_dynamic_import_consumers(self, typescript_backend, tmp_path):
+        """Preview and apply share one plan, so dynamic import() consumers appear in both."""
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"ES2020","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        (project / "src" / "db.ts").write_text("export class Database {}\n")
+        (project / "src" / "dyn.ts").write_text(
+            'export const loader = () => import("./db");\n'
+        )
+
+        preview = typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(project),
+            dry_run=True,
+        )
+        assert "src/dyn.ts" in preview["affected_files"]
+        assert (project / "src" / "db.ts").exists()
+
+        typescript_backend.move_module(
+            source="src/db.ts",
+            target="src/storage/db.ts",
+            project_root=str(project),
+            dry_run=False,
+        )
+        assert "./storage/db" in (project / "src" / "dyn.ts").read_text()
+
+
+class TestMoveSymbolCodeValidity:
+    """Symbol moves must produce syntactically valid import forms."""
+
+    def _project(self, tmp_path):
+        project = tmp_path / "tsproject"
+        project.mkdir()
+        (project / "tsconfig.json").write_text(
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["src/**/*"]}'
+        )
+        (project / "src").mkdir()
+        return project
+
+    def test_namespace_dependency_moves_validly(self, typescript_backend, tmp_path):
+        project = self._project(tmp_path)
+        (project / "src" / "dep.ts").write_text("export const val = 1;\n")
+        (project / "src" / "source.ts").write_text(
+            'import * as dep from "./dep";\n\n'
+            "export function pick(): number {\n    return dep.val;\n}\n\n"
+            "export function stay(): number {\n    return 2;\n}\n"
+        )
+        (project / "src" / "target.ts").write_text("")
+
+        typescript_backend.move_symbol(
+            source_file="src/source.ts",
+            symbol_name="pick",
+            target_file="src/target.ts",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        target_text = (project / "src" / "target.ts").read_text()
+        assert 'import * as dep from "./dep"' in target_text
+        assert "* as * as" not in target_text
+
+    def test_private_symbol_move_exports_it_for_the_source(self, typescript_backend, tmp_path):
+        project = self._project(tmp_path)
+        (project / "src" / "source.ts").write_text(
+            "function secretCalc(): number {\n    return 42;\n}\n\n"
+            "export function api(): number {\n    return secretCalc();\n}\n"
+        )
+        (project / "src" / "target.ts").write_text("")
+
+        result = typescript_backend.move_symbol(
+            source_file="src/source.ts",
+            symbol_name="secretCalc",
+            target_file="src/target.ts",
+            project_root=str(project),
+            dry_run=False,
+        )
+
+        assert "export function secretCalc" in (project / "src" / "target.ts").read_text()
+        source_text = (project / "src" / "source.ts").read_text()
+        assert "secretCalc" in source_text
+        assert 'from "./target"' in source_text
+        assert any("secretCalc" in warning for warning in result["warnings"])
+
+    def test_move_between_language_families_is_refused(self, typescript_backend, temp_typescript_project):
+        with pytest.raises(Exception, match="language families"):
+            typescript_backend.move_module(
+                source="src/db.ts",
+                target="src/db.js",
+                project_root=str(temp_typescript_project),
+                dry_run=True,
+            )

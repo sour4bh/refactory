@@ -163,6 +163,135 @@ function filterProjectSourceFiles(project, root) {
   });
 }
 
+function isInSkipDir(filePath, root) {
+  const relativePath = path.relative(root, filePath);
+  if (relativePath.startsWith("..")) {
+    return false;
+  }
+  return relativePath.split(path.sep).some((part) => SKIP_DIRS.has(part));
+}
+
+// Every mutating operation runs fully in memory (preview and apply use the
+// same plan), then commits through this two-phase writer instead of
+// project.saveSync(): stage temp siblings first (nothing changes if any
+// staging write fails), then rename into place with in-memory backups and
+// restore everything on a mid-commit failure. Files under SKIP_DIRS are
+// never written, even when a tsconfig include pulled them into the project.
+function collectWritePlan(project, root, deletePaths = []) {
+  const writes = project.getSourceFiles()
+    .filter((sourceFile) => !sourceFile.isSaved())
+    .filter((sourceFile) => isInsideRoot(sourceFile.getFilePath(), root))
+    .filter((sourceFile) => !isInSkipDir(sourceFile.getFilePath(), root))
+    .map((sourceFile) => ({ path: sourceFile.getFilePath(), text: sourceFile.getFullText() }));
+  const writePaths = new Set(writes.map((write) => write.path));
+  const deletes = deletePaths.filter((deletePath) => fs.existsSync(deletePath) && !writePaths.has(deletePath));
+  return { writes, deletes };
+}
+
+const TMP_SUFFIX = ".refactory-tmp";
+
+function commitFileChanges(plan) {
+  const staged = [];
+  try {
+    for (const write of plan.writes) {
+      fs.mkdirSync(path.dirname(write.path), { recursive: true });
+      const tmpPath = write.path + TMP_SUFFIX;
+      fs.writeFileSync(tmpPath, write.text);
+      staged.push({ path: write.path, tmpPath });
+    }
+  } catch (error) {
+    for (const entry of staged) {
+      try { fs.unlinkSync(entry.tmpPath); } catch { /* staging leftovers only */ }
+    }
+    throw new Error(`refused without changing any file: ${error.message}`);
+  }
+
+  const backups = [];
+  try {
+    for (const entry of staged) {
+      const prior = fs.existsSync(entry.path) ? fs.readFileSync(entry.path) : null;
+      fs.renameSync(entry.tmpPath, entry.path);
+      backups.push({ path: entry.path, prior });
+    }
+    for (const deletePath of plan.deletes) {
+      const prior = fs.readFileSync(deletePath);
+      fs.unlinkSync(deletePath);
+      backups.push({ path: deletePath, prior });
+    }
+  } catch (error) {
+    const restoreFailures = [];
+    for (const backup of backups.reverse()) {
+      try {
+        if (backup.prior === null) {
+          fs.unlinkSync(backup.path);
+        } else {
+          fs.writeFileSync(backup.path, backup.prior);
+        }
+      } catch {
+        restoreFailures.push(backup.path);
+      }
+    }
+    for (const entry of staged) {
+      try { fs.unlinkSync(entry.tmpPath); } catch { /* already renamed or gone */ }
+    }
+    const suffix = restoreFailures.length > 0
+      ? `; could not restore: ${restoreFailures.join(", ")}`
+      : "";
+    throw new Error(`rolled back after write failure: ${error.message}${suffix}`);
+  }
+}
+
+function assertNoSyntaxErrorsInPlan(project, plan) {
+  const program = project.getProgram();
+  const problems = [];
+  for (const write of plan.writes) {
+    const sourceFile = project.getSourceFile(write.path);
+    if (!sourceFile) {
+      continue;
+    }
+    for (const diagnostic of program.getSyntacticDiagnostics(sourceFile)) {
+      const message = diagnostic.getMessageText();
+      const messageText = typeof message === "string" ? message : message.getMessageText();
+      problems.push(`${path.basename(write.path)}: ${messageText}`);
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(`refused: the change would produce invalid syntax: ${problems.slice(0, 5).join("; ")}`);
+  }
+}
+
+const TYPESCRIPT_EXTENSIONS = new Set([".ts", ".tsx"]);
+
+function assertSameLanguageFamily(sourceName, targetName) {
+  const family = (filePath) => (TYPESCRIPT_EXTENSIONS.has(path.extname(filePath)) ? "TypeScript" : "JavaScript");
+  if (family(sourceName) !== family(targetName)) {
+    throw new Error(
+      `cannot move between language families: ${sourceName} is ${family(sourceName)} and ` +
+      `${targetName} is ${family(targetName)}; type annotations do not survive the move, ` +
+      `so convert the file explicitly first`
+    );
+  }
+}
+
+function exportMovedDeclaration(targetFile, symbolName) {
+  const named =
+    targetFile.getFunction(symbolName)
+    || targetFile.getClass(symbolName)
+    || targetFile.getInterface(symbolName)
+    || targetFile.getTypeAlias(symbolName)
+    || targetFile.getEnum(symbolName);
+  if (named) {
+    named.setIsExported(true);
+    return;
+  }
+  const variableDeclaration = targetFile.getVariableDeclaration(symbolName);
+  if (variableDeclaration) {
+    variableDeclaration.getVariableStatement().setIsExported(true);
+    return;
+  }
+  throw new Error(`could not export moved symbol ${symbolName} in the target file`);
+}
+
 function crawlProjectFiles(root) {
   const rootRealPath = fs.realpathSync(root);
   const files = new Set();
@@ -693,7 +822,7 @@ function classifyImportDeclaration(declaration) {
       kind: "namespace",
       moduleSpecifier,
       resolvedFilePath,
-      name: declaration.getText(),
+      name: declaration.getNameNode().getText(),
       isTypeOnly: false,
     };
   }
@@ -914,6 +1043,7 @@ function moveModule(args) {
   const targetPath = validatePath(target, projectRoot);
   validateSourceExtension(source, "source");
   validateSourceExtension(target, "target");
+  assertSameLanguageFamily(source, target);
   if (sourcePath === targetPath) {
     throw new Error("source and target are identical");
   }
@@ -932,15 +1062,6 @@ function moveModule(args) {
   const loaded = loadProjectSourceFiles(project, root);
   const warnings = [...loaded.warnings];
 
-  if (!dryRun && overwrite && fs.existsSync(targetPath) && targetPath !== sourcePath) {
-    const existingTarget = project.getSourceFile(targetPath);
-    if (existingTarget) {
-      existingTarget.deleteImmediatelySync();
-    } else {
-      fs.unlinkSync(targetPath);
-    }
-  }
-
   const projectFiles = filterProjectSourceFiles(project, root);
   const sourceFile = project.getSourceFile(sourcePath) || project.addSourceFileAtPath(sourcePath);
   const sourceFilePath = sourceFile.getFilePath();
@@ -950,61 +1071,68 @@ function moveModule(args) {
   }
 
   const moduleReferences = collectModuleReferences(projectFiles, sourceFilePath);
-  const affectedFiles = [source, target, ...moduleReferences.map((entry) => path.relative(root, entry.file.getFilePath()))];
 
-  if (!dryRun) {
-    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-    sourceFile.move(targetPath);
+  sourceFile.move(targetPath, { overwrite });
 
-    for (const entry of moduleReferences) {
-      for (const { declaration, originalSpecifier } of entry.imports) {
-        declaration.setModuleSpecifier(
-          toModuleSpecifier(entry.file.getFilePath(), targetPath, {
-            originalSpecifier,
-            project,
-          })
-        );
-      }
-
-      for (const { declaration, originalSpecifier } of entry.exports) {
-        declaration.setModuleSpecifier(
-          toModuleSpecifier(entry.file.getFilePath(), targetPath, {
-            originalSpecifier,
-            project,
-          })
-        );
-      }
-
-      for (const { callExpression, originalSpecifier } of entry.requires) {
-        const [firstArgument] = callExpression.getArguments();
-        if (!firstArgument) {
-          continue;
-        }
-        firstArgument.replaceWithText(JSON.stringify(
-          toModuleSpecifier(entry.file.getFilePath(), targetPath, {
-            originalSpecifier,
-            project,
-          })
-        ));
-      }
+  for (const entry of moduleReferences) {
+    for (const { declaration, originalSpecifier } of entry.imports) {
+      declaration.setModuleSpecifier(
+        toModuleSpecifier(entry.file.getFilePath(), targetPath, {
+          originalSpecifier,
+          project,
+        })
+      );
     }
 
-    project.saveSync();
+    for (const { declaration, originalSpecifier } of entry.exports) {
+      declaration.setModuleSpecifier(
+        toModuleSpecifier(entry.file.getFilePath(), targetPath, {
+          originalSpecifier,
+          project,
+        })
+      );
+    }
+
+    for (const { callExpression, originalSpecifier } of entry.requires) {
+      const [firstArgument] = callExpression.getArguments();
+      if (!firstArgument) {
+        continue;
+      }
+      firstArgument.replaceWithText(JSON.stringify(
+        toModuleSpecifier(entry.file.getFilePath(), targetPath, {
+          originalSpecifier,
+          project,
+        })
+      ));
+    }
   }
+
+  const plan = collectWritePlan(project, root, [sourcePath]);
+  assertNoSyntaxErrorsInPlan(project, plan);
+  if (!dryRun) {
+    commitFileChanges(plan);
+  }
+
+  const planAffectedFiles = [...new Set([
+    source,
+    target,
+    ...plan.writes.map((write) => path.relative(root, write.path)),
+    ...plan.deletes.map((deletePath) => path.relative(root, deletePath)),
+  ])];
 
   return {
     success: true,
     dry_run: dryRun,
     source,
     target,
-    affected_files: [...new Set(affectedFiles)],
-    changes_count: [...new Set(affectedFiles)].length,
+    affected_files: planAffectedFiles,
+    changes_count: planAffectedFiles.length,
     warnings,
     ...(dryRun ? {
       preview: [
         `Move module ${source} to ${target}.`,
         overwrite && fs.existsSync(targetPath) ? "Existing target would be overwritten." : "",
-        `Affected files: ${[...new Set(affectedFiles)].join(", ")}`,
+        `Affected files: ${planAffectedFiles.join(", ")}`,
       ].filter(Boolean).join("\n"),
     } : {}),
   };
@@ -1016,6 +1144,7 @@ function moveSymbol(args) {
   const targetPath = validatePath(tgtPath, projectRoot);
   validateSourceExtension(srcPath, "source_file");
   validateSourceExtension(tgtPath, "target_file");
+  assertSameLanguageFamily(srcPath, tgtPath);
   if (sourcePath === targetPath) {
     throw new Error("source and target are identical");
   }
@@ -1066,18 +1195,14 @@ function moveSymbol(args) {
   const sourceSpecifier = toModuleSpecifier(sourceFilePath, targetFilePath, { project });
   const referencingNodes = symbol.findReferencesAsNodes ? symbol.findReferencesAsNodes() : [];
   const referencingFiles = [...new Set(referencingNodes.map((node) => node.getSourceFile()))];
-  const affectedFiles = [
-    srcPath,
-    tgtPath,
-    ...referencingFiles
-      .filter((file) => file.getFilePath() !== sourceFilePath && file.getFilePath() !== targetFilePath)
-      .map((file) => path.relative(root, file.getFilePath())),
-  ];
 
-  if (!dryRun) {
+  { // The mutation runs in memory for preview and apply alike; only the commit below is gated.
     targetFile.addStatements(getMovedSymbolText(symbol));
 
     for (const dependency of dependencies.passThroughImports) {
+      if (dependency.resolvedFilePath === targetFilePath) {
+        continue;
+      }
       ensureDependencyImport(
         targetFile,
         dependencyModuleSpecifier(targetFilePath, dependency, project),
@@ -1169,11 +1294,21 @@ function moveSymbol(args) {
     });
 
     if (sourceStillReferencesSymbol) {
-      ensureNamedImport(sourceFile, sourceSpecifier, {
-        name: symbolName,
-        alias: undefined,
-        isTypeOnly: isTypeOnlySymbol,
-      });
+      if (!isExported) {
+        exportMovedDeclaration(targetFile, symbolName);
+        warnings.push(
+          `${symbolName} was not exported; it is now exported from ${tgtPath} so ${srcPath} can import it back`
+        );
+      }
+      if (isDefaultExport) {
+        ensureDefaultImport(sourceFile, sourceSpecifier, symbolName);
+      } else {
+        ensureNamedImport(sourceFile, sourceSpecifier, {
+          name: symbolName,
+          alias: undefined,
+          isTypeOnly: isTypeOnlySymbol,
+        });
+      }
     }
 
     if (isExported) {
@@ -1188,8 +1323,19 @@ function moveSymbol(args) {
       }
     }
 
-    project.saveSync();
   }
+
+  const plan = collectWritePlan(project, root);
+  assertNoSyntaxErrorsInPlan(project, plan);
+  if (!dryRun) {
+    commitFileChanges(plan);
+  }
+
+  const planAffectedFiles = [...new Set([
+    srcPath,
+    tgtPath,
+    ...plan.writes.map((write) => path.relative(root, write.path)),
+  ])];
 
   return {
     success: true,
@@ -1197,12 +1343,12 @@ function moveSymbol(args) {
     symbol: symbolName,
     source: srcPath,
     target: tgtPath,
-    affected_files: [...new Set(affectedFiles)],
+    affected_files: planAffectedFiles,
     warnings,
     ...(dryRun ? {
       preview: [
         `Move symbol ${symbolName} from ${srcPath} to ${tgtPath}.`,
-        `Affected files: ${[...new Set(affectedFiles)].join(", ")}`,
+        `Affected files: ${planAffectedFiles.join(", ")}`,
       ].join("\n"),
     } : {}),
   };
@@ -1224,14 +1370,18 @@ function renameSymbol(args) {
     warnings.push(scopeWarning);
   }
 
-  const referencingNodes = symbol.findReferencesAsNodes ? symbol.findReferencesAsNodes() : [];
-  const referencingFiles = [...new Set(referencingNodes.map((node) => node.getSourceFile()))];
-  const affectedFiles = [file, ...referencingFiles.map((source) => path.relative(root, source.getFilePath()))];
+  symbol.rename(newName);
 
+  const plan = collectWritePlan(project, root);
+  assertNoSyntaxErrorsInPlan(project, plan);
   if (!dryRun) {
-    symbol.rename(newName);
-    project.saveSync();
+    commitFileChanges(plan);
   }
+
+  const planAffectedFiles = [...new Set([
+    file,
+    ...plan.writes.map((write) => path.relative(root, write.path)),
+  ])];
 
   return {
     success: true,
@@ -1239,12 +1389,12 @@ function renameSymbol(args) {
     old_name: oldName,
     new_name: newName,
     file,
-    affected_files: [...new Set(affectedFiles)],
+    affected_files: planAffectedFiles,
     warnings,
     ...(dryRun ? {
       preview: [
         `Rename ${oldName} to ${newName} in ${file}.`,
-        `Affected files: ${[...new Set(affectedFiles)].join(", ")}`,
+        `Affected files: ${planAffectedFiles.join(", ")}`,
       ].join("\n"),
     } : {}),
   };
