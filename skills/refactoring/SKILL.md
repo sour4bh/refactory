@@ -124,7 +124,7 @@ After refactoring:
 - Break backward compatibility without deprecation
 
 ✅ **Do:**
-- Preview with dry_run=true first
+- Preview first (omit apply, or pass apply: false); execute with apply: true
 - Re-export from package root if public API
 - Update all relative imports
 - Add deprecation warnings for moved public APIs

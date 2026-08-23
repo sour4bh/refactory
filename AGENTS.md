@@ -1,10 +1,10 @@
 # AGENTS.md
 
-This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
+This file provides guidance to coding agents (Claude Code, Codex) when working with code in this repository.
 
 ## Project Overview
 
-**Refactory** is an MCP (Model Context Protocol) plugin that provides token-efficient codebase refactoring tools. Instead of manually editing imports across dozens of files, Codex calls specialized tools that handle refactoring operations atomically.
+**Refactory** is an MCP (Model Context Protocol) plugin that provides token-efficient codebase refactoring tools. Instead of manually editing imports across dozens of files, the agent calls specialized tools that handle refactoring operations atomically.
 
 The plugin supports both Python (via Rope library) and TypeScript (via ts-morph).
 
@@ -76,7 +76,7 @@ The test suite uses hermetic fixtures (`tests/conftest.py`) that create isolated
 - Handles all TypeScript/JavaScript refactoring operations
 - Executes as subprocess from Python backend
 
-### Tool Interface (What Codex Calls)
+### Tool Interface (What the Agent Calls)
 
 All tools accept:
 - `project_root` (required absolute path)
@@ -99,13 +99,13 @@ Tools return structured JSON with operation summary and affected files list.
 
 ## Data Flow
 
-1. Codex calls MCP tool with file paths and operation parameters
+1. The agent calls the MCP tool with file paths and operation parameters
 2. `main.py` detects language from file extension
 3. Backend instantiated and method called with parsed arguments
 4. **Python**: Uses Rope library directly to modify AST and imports
 5. **TypeScript**: Spawns subprocess to run `refactor.js`
-6. Result serialized as JSON and returned to Codex
-7. Codex displays result or performs follow-up operations
+6. Result serialized as JSON and returned to the agent
+7. The agent displays the result or performs follow-up operations
 
 ## Key Technical Details
 
