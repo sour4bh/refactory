@@ -8,7 +8,29 @@ const fs = require("fs");
 const path = require("path");
 
 const SUPPORTED_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx"]);
-const SKIP_DIRS = new Set([".git", "dist", "node_modules"]);
+// Generated output and virtualenvs are not sources. Crawling them is not just
+// slow: a Next.js .next tree alone can push ts-morph past the default V8 heap
+// and abort the whole refactor with an OOM.
+const SKIP_DIRS = new Set([
+  ".git",
+  ".next",
+  ".nuxt",
+  ".output",
+  ".source",
+  ".svelte-kit",
+  ".turbo",
+  ".venv",
+  "__pycache__",
+  "build",
+  "coverage",
+  "dist",
+  "node_modules",
+  "out",
+  "venv",
+]);
+// A workspace member is refactored in isolation, so a rename here cannot reach
+// sibling packages. These markers let us say so instead of reporting success.
+const WORKSPACE_MARKERS = ["pnpm-workspace.yaml", "lerna.json", "turbo.json"];
 const REFACTOR_DIAGNOSTIC_CODES = new Set([2304, 2305, 2306, 2307, 2724]);
 
 function isInsideRoot(candidate, rootRealPath) {
@@ -69,6 +91,69 @@ function getProject(projectRoot) {
   return new Project({
     compilerOptions: { allowJs: true, checkJs: false },
   });
+}
+
+function findWorkspaceRootAbove(root) {
+  let current = path.dirname(path.resolve(root));
+  while (true) {
+    for (const marker of WORKSPACE_MARKERS) {
+      if (fs.existsSync(path.join(current, marker))) {
+        return current;
+      }
+    }
+    const packageJsonPath = path.join(current, "package.json");
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        if (JSON.parse(fs.readFileSync(packageJsonPath, "utf8")).workspaces) {
+          return current;
+        }
+      } catch {
+        // An unreadable package.json is not evidence of a workspace.
+      }
+    }
+    // The repository root is the outermost place a workspace can live; stop there
+    // rather than walking into the user's home directory.
+    if (fs.existsSync(path.join(current, ".git"))) {
+      return null;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function exportedNamesOf(sourceFile, only = null) {
+  let names;
+  try {
+    names = [...sourceFile.getExportedDeclarations().keys()];
+  } catch {
+    return [];
+  }
+  return only === null ? names : names.filter((name) => name === only);
+}
+
+// Returns a warning when the scanned root is one package of a larger workspace and
+// the symbols being changed are exported, because references from sibling packages
+// are outside the scan and stay untouched. Silence there reads as "nothing else
+// used it", which is how a partial rename ships.
+function workspaceScopeWarning(root, exportedNames) {
+  if (exportedNames.length === 0) {
+    return null;
+  }
+  const workspaceRoot = findWorkspaceRootAbove(root);
+  if (workspaceRoot === null) {
+    return null;
+  }
+  const shown = exportedNames.slice(0, 5).join(", ");
+  const rest = exportedNames.length > 5 ? `, +${exportedNames.length - 5} more` : "";
+  return (
+    `${path.relative(workspaceRoot, path.resolve(root)) || "."} is one package of the workspace at ` +
+    `${workspaceRoot}, and only files under it were scanned. Exported here: ${shown}${rest}. ` +
+    `References from sibling packages were NOT updated — re-run with project_root set to ` +
+    `${workspaceRoot}, or fix the other packages yourself.`
+  );
 }
 
 function filterProjectSourceFiles(project, root) {
@@ -853,6 +938,11 @@ function moveModule(args) {
   const projectFiles = filterProjectSourceFiles(project, root);
   const sourceFile = project.getSourceFile(sourcePath) || project.addSourceFileAtPath(sourcePath);
   const sourceFilePath = sourceFile.getFilePath();
+  const scopeWarning = workspaceScopeWarning(root, exportedNamesOf(sourceFile));
+  if (scopeWarning !== null) {
+    warnings.push(scopeWarning);
+  }
+
   const moduleReferences = collectModuleReferences(projectFiles, sourceFilePath);
   const affectedFiles = [source, target, ...moduleReferences.map((entry) => path.relative(root, entry.file.getFilePath()))];
 
@@ -936,6 +1026,11 @@ function moveSymbol(args) {
     } else {
       targetFile = project.createSourceFile(targetPath, "", { overwrite: false });
     }
+  }
+
+  const scopeWarning = workspaceScopeWarning(root, exportedNamesOf(sourceFile, symbolName));
+  if (scopeWarning !== null) {
+    warnings.push(scopeWarning);
   }
 
   const symbol = resolveMovableSymbol(sourceFile, symbolName);
@@ -1117,6 +1212,11 @@ function renameSymbol(args) {
   const warnings = [...loaded.warnings];
   const sourceFile = project.getSourceFile(sourcePath) || project.addSourceFileAtPath(sourcePath);
   const symbol = selectRenameCandidate(sourceFile, oldName, line, column);
+
+  const scopeWarning = workspaceScopeWarning(root, exportedNamesOf(sourceFile, oldName));
+  if (scopeWarning !== null) {
+    warnings.push(scopeWarning);
+  }
 
   const referencingNodes = symbol.findReferencesAsNodes ? symbol.findReferencesAsNodes() : [];
   const referencingFiles = [...new Set(referencingNodes.map((node) => node.getSourceFile()))];

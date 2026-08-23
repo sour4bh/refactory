@@ -921,3 +921,104 @@ class TestDependencyProbe:
                 )
 
         assert call_count["n"] == 0  # cached result reused; probe not re-invoked
+
+
+class TestWorkspaceScope:
+    """Crawl exclusions and the warning for refactoring one workspace package."""
+
+    @staticmethod
+    def _write_package(root: Path, *, tsconfig: bool = True) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        if tsconfig:
+            (root / "tsconfig.json").write_text(
+                '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},'
+                '"include":["src/**/*"]}'
+            )
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src" / "api.ts").write_text("export function handler(): number {\n    return 1;\n}\n")
+
+    def test_generated_output_is_not_crawled(self, typescript_backend, tmp_path):
+        """A build artifact referencing the symbol must not be rewritten."""
+        project = tmp_path / "app"
+        self._write_package(project)
+        # Same shape as a Next.js build tree: real .ts on disk, not a source of truth.
+        (project / ".next").mkdir()
+        (project / ".next" / "leaked.ts").write_text(
+            'import { handler } from "../src/api";\n\nexport const compiled = handler();\n'
+        )
+
+        result = typescript_backend.rename_symbol(
+            file="src/api.ts",
+            old_name="handler",
+            new_name="handleRequest",
+            project_root=str(project),
+            dry_run=True,
+        )
+
+        assert result["success"] is True
+        assert not any(".next" in name for name in result["affected_files"])
+        assert "handler" in (project / ".next" / "leaked.ts").read_text()
+
+    def test_warns_when_renaming_an_export_inside_a_workspace_package(
+        self, typescript_backend, tmp_path
+    ):
+        """Sibling packages are outside the scan, so silence would be misleading."""
+        workspace = tmp_path / "monorepo"
+        workspace.mkdir()
+        (workspace / "pnpm-workspace.yaml").write_text('packages:\n  - "packages/*"\n')
+        package = workspace / "packages" / "contracts"
+        self._write_package(package)
+
+        result = typescript_backend.rename_symbol(
+            file="src/api.ts",
+            old_name="handler",
+            new_name="handleRequest",
+            project_root=str(package),
+            dry_run=True,
+        )
+
+        assert result["success"] is True
+        assert len(result["warnings"]) == 1
+        warning = result["warnings"][0]
+        assert str(workspace) in warning
+        assert "handler" in warning
+        assert "NOT updated" in warning
+
+    def test_no_warning_for_a_standalone_project(self, typescript_backend, tmp_path):
+        """Without a workspace above it, the scan is already complete."""
+        project = tmp_path / "solo"
+        self._write_package(project)
+
+        result = typescript_backend.rename_symbol(
+            file="src/api.ts",
+            old_name="handler",
+            new_name="handleRequest",
+            project_root=str(project),
+            dry_run=True,
+        )
+
+        assert result["warnings"] == []
+
+    def test_no_warning_when_the_symbol_is_not_exported(
+        self, typescript_backend, tmp_path
+    ):
+        """A module-private symbol cannot be referenced from a sibling package."""
+        workspace = tmp_path / "monorepo"
+        workspace.mkdir()
+        (workspace / "pnpm-workspace.yaml").write_text('packages:\n  - "packages/*"\n')
+        package = workspace / "packages" / "contracts"
+        self._write_package(package)
+        (package / "src" / "api.ts").write_text(
+            "function internal(): number {\n    return 1;\n}\n\n"
+            "export const value = internal();\n"
+        )
+
+        result = typescript_backend.rename_symbol(
+            file="src/api.ts",
+            old_name="internal",
+            new_name="computeInternal",
+            project_root=str(package),
+            dry_run=True,
+        )
+
+        assert result["warnings"] == []
