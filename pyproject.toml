@@ -1,8 +1,8 @@
 [project]
 name = "refactory"
-version = "1.0.4"
+version = "1.1.0"
 description = "Token-efficient codebase refactoring plugin for Claude Code"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "mcp>=1.0.0",
     "rope>=1.13.0",
