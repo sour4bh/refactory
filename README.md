@@ -1,6 +1,6 @@
 # refactory
 
-> Codebase refactoring as MCP tools. Move modules, rename symbols, validate imports — atomically, across languages.
+> Codebase refactoring as MCP tools. Move modules, rename symbols, validate imports — across languages, preview-first.
 
 ```bash
 claude --plugin-dir ~/dev/refactory
@@ -161,6 +161,7 @@ Test coverage: `move_module`, `move_symbol`, `rename_symbol`, `validate_imports`
 - Python `move_module` and `move_symbol` fail closed on two known Rope hazards rather than silently corrupt consumer files:
   - **Basename collision** — if the source file exports a top-level binding with the same name as the module (e.g. `project_service = ProjectService()` inside `project_service.py`), Rope confuses variable attribute access with module attribute access and rewrites `project_service.method()` call sites incorrectly. Rename the binding first, then retry.
   - **Lazy (in-function) imports** — Rope hoists in-function `import` statements to module top, breaking circular-import workarounds. If any consumer imports the moved module/symbol from inside a function, refactory refuses and lists every offending site. Un-lazy those imports (or resolve the underlying circular dependency) first.
+- Failed operations roll back their staged changes (package scaffolding, target removal, intermediate moves) on the Python side, and both backends refuse before touching disk when the source is missing or the overwrite target is not a regular file. The write phase itself is not yet transactional: a mid-save failure such as a permission or disk error can still leave some consumer files updated and others not. A plan/commit boundary with backups is the planned fix.
 - All MCP tools require an explicit absolute `project_root`. In linked worktrees, pass the worker checkout's import root directly (for example `.../worker/backend`) so cwd drift cannot silently select the main checkout.
 - Python `move_symbol` previews require the target module to already exist on disk. Rope cannot compute an exact import-rewrite preview against a module it cannot read, and refactory refuses to fabricate or stage one. Create the destination file first (an empty file is fine) or run with `apply: true`.
 - `move_symbol` is conservative across barrel / re-export boundaries. If the source is a pure re-export (`export { X } from "./impl"`) or if callers reach the symbol through a re-export chain, refactory refuses rather than guess — an honest refusal beats a silent corruption. A hand-rolled bash/ast-grep chain remains the right tool for those refactors.

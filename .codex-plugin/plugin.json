@@ -1,6 +1,6 @@
 {
   "name": "refactory",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Token-efficient codebase refactoring via MCP tools for Python and TypeScript projects.",
   "author": {
     "name": "sour4bh"

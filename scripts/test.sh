@@ -24,6 +24,17 @@ if ! python -c "import mcp" 2>/dev/null; then
     pip install mcp
 fi
 
-# Run tests
+# Run tests. pyproject.toml sets testpaths=["tests"], so a bare run covers
+# the full suite while explicit paths and -k filters pass through unchanged.
 echo "Running tests..."
-PYTHONPATH="$PROJECT_ROOT/server:$PYTHONPATH" pytest tests/ -v "$@"
+if [ "$#" -gt 0 ]; then
+    PYTHONPATH="$PROJECT_ROOT/server:$PYTHONPATH" pytest "$@"
+else
+    PYTHONPATH="$PROJECT_ROOT/server:$PYTHONPATH" pytest -v
+fi
+
+# Gate the plugin packaging whenever the claude CLI is available.
+if command -v claude >/dev/null 2>&1; then
+    echo "Validating plugin packaging..."
+    claude plugin validate "$PROJECT_ROOT" --strict
+fi
