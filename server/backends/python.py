@@ -3,7 +3,9 @@ import ast
 import importlib.machinery
 import importlib.util
 import logging
+import shutil
 import subprocess
+import tokenize
 from pathlib import Path
 from typing import Any
 
@@ -458,8 +460,51 @@ class PythonBackend:
 
     def _do(self, project, root: Path, change: Any, txn: _AppliedChanges) -> None:
         self._assert_change_inside_project_root(project, root, change)
-        project.do(change)
+        snapshot = self._snapshot_change_targets(root, change)
+        try:
+            project.do(change)
+        except Exception:
+            # Rope applies a composite change file by file with no rollback of
+            # its own; a mid-change failure (permission, disk) leaves earlier
+            # writes on disk and records nothing in history. Restore the bytes
+            # of everything this change was allowed to touch, then re-raise so
+            # the entry point can undo previously completed changes.
+            self._restore_snapshot(snapshot)
+            raise
         txn.count += 1
+
+    def _snapshot_change_targets(self, root: Path, change: Any) -> list[tuple[Path, bytes | None, bool]]:
+        """Capture (path, bytes-or-None, existed-as-dir) for each resource a change touches."""
+        entries: list[tuple[Path, bytes | None, bool]] = []
+        try:
+            resources = change.get_changed_resources()
+        except Exception:
+            return entries
+        for resource in resources:
+            real = root / getattr(resource, "path", "")
+            if real.is_file():
+                entries.append((real, real.read_bytes(), False))
+            elif real.is_dir():
+                entries.append((real, None, True))
+            else:
+                entries.append((real, None, False))
+        return entries
+
+    def _restore_snapshot(self, snapshot: list[tuple[Path, bytes | None, bool]]) -> None:
+        """Best-effort byte-level restore after a failed Rope apply."""
+        for real, data, was_dir in reversed(snapshot):
+            try:
+                if data is not None:
+                    real.parent.mkdir(parents=True, exist_ok=True)
+                    real.write_bytes(data)
+                elif was_dir:
+                    continue
+                elif real.is_file():
+                    real.unlink()
+                elif real.is_dir():
+                    shutil.rmtree(real)
+            except OSError:
+                logger.warning("could not restore %s after a failed change", real)
 
     def _collect_changed_python_files(self, *changes: Any) -> list[str]:
         """Collect changed Python files from Rope Change objects."""
@@ -599,12 +644,77 @@ class PythonBackend:
 
         return None
 
-    def _module_spec(self, module_name: str):
-        """Resolve an external module spec without importing the module."""
+    def _target_owns_binding(self, target_path: Path, root: Path, symbol_name: str, source_path: Path) -> bool:
+        """True when the target module already binds symbol_name itself.
+
+        An import of the moved symbol from the source module does not count:
+        Rope rewires that import into the moved definition. Any other binding
+        with the same name would silently shadow or be shadowed by the move.
+        Control-flow bodies at module scope are searched too.
+        """
         try:
-            return importlib.util.find_spec(module_name)
+            with tokenize.open(target_path) as handle:
+                tree = ast.parse(handle.read())
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            return False
+
+        def binds(node: ast.stmt) -> bool:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return node.name == symbol_name
+            if isinstance(node, ast.Assign):
+                return any(isinstance(target, ast.Name) and target.id == symbol_name for target in node.targets)
+            if isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                return isinstance(node.target, ast.Name) and node.target.id == symbol_name
+            if isinstance(node, ast.Import):
+                return any((alias.asname or alias.name.split(".")[0]) == symbol_name for alias in node.names)
+            if isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name == "*" or (alias.asname or alias.name) != symbol_name:
+                        continue
+                    parts = self._resolve_import_parts(target_path, root, node.module, node.level)
+                    module_file = self._find_local_module(root, parts) if parts is not None else None
+                    if module_file is not None and self._same_file(module_file, source_path):
+                        continue
+                    return True
+            return False
+
+        def check(statements: list[ast.stmt]) -> bool:
+            for node in statements:
+                if binds(node):
+                    return True
+                if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith, ast.Try)):
+                    bodies = [
+                        getattr(node, "body", []),
+                        getattr(node, "orelse", []),
+                        getattr(node, "finalbody", []),
+                        *[handler.body for handler in getattr(node, "handlers", [])],
+                    ]
+                    if any(check(body) for body in bodies):
+                        return True
+            return False
+
+        return check(tree.body)
+
+    def _module_spec(self, module_name: str):
+        """Resolve an external module spec without executing package code.
+
+        importlib.util.find_spec on a dotted name imports the parent package,
+        so a read-only validation could run installed __init__ code. Resolve
+        the top level (no parent to import), then walk submodule search
+        locations statically with PathFinder.
+        """
+        parts = module_name.split(".")
+        try:
+            spec = importlib.util.find_spec(parts[0])
         except (ImportError, ModuleNotFoundError, ValueError):
             return None
+        for part in parts[1:]:
+            if spec is None or not spec.submodule_search_locations:
+                return None
+            spec = importlib.machinery.PathFinder.find_spec(
+                part, list(spec.submodule_search_locations)
+            )
+        return spec
 
     def _module_exists_externally(self, module_name: str) -> bool:
         """Check whether a module resolves outside the project."""
@@ -806,19 +916,26 @@ class PythonBackend:
                                     "text": self._format_import_from(node),
                                 })
                                 matched = True
-                        if symbol_name is None and not matched:
+                        if not matched:
                             for alias in node.names:
                                 if alias.name == "*":
                                     continue
                                 sub_file = self._find_local_module(
                                     root, module_parts + [alias.name]
                                 )
-                                if sub_file and self._same_file(sub_file, target_source_path):
-                                    hits.append({
-                                        "line": node.lineno,
-                                        "text": self._format_import_from(node),
-                                    })
-                                    break
+                                if not sub_file or not self._same_file(sub_file, target_source_path):
+                                    continue
+                                if symbol_name is not None and not self._scope_uses_qualified_symbol(
+                                    function_scope,
+                                    alias.asname or alias.name,
+                                    symbol_name,
+                                ):
+                                    continue
+                                hits.append({
+                                    "line": node.lineno,
+                                    "text": self._format_import_from(node),
+                                })
+                                break
 
             for child in ast.iter_child_nodes(node):
                 visit(child, inside_function or is_function, next_scope)
@@ -1257,6 +1374,12 @@ class PythonBackend:
                 f"preview; create '{target_file}' first or call the MCP tool with apply: true"
             )
 
+        if target_path.is_file() and self._target_owns_binding(target_path, root, symbol_name, source_path):
+            raise ValueError(
+                f"target {target_file} already defines '{symbol_name}'; moving would create "
+                f"two definitions and silently change which one consumers get"
+            )
+
         self._check_rope_hazards(
             source_path,
             root,
@@ -1617,7 +1740,8 @@ class PythonBackend:
 
         for py_file in self._project_python_files_for_scan(root):
             try:
-                source = py_file.read_text()
+                with tokenize.open(py_file) as handle:
+                    source = handle.read()
                 tree = ast.parse(source)
 
                 for node in ast.walk(tree):
@@ -1641,6 +1765,11 @@ class PythonBackend:
                     "type": "syntax_error",
                 })
             except Exception as exc:
-                logger.warning(f"Error checking {py_file}: {exc}")
+                errors.append({
+                    "file": str(py_file.relative_to(root)),
+                    "line": 0,
+                    "error": f"could not analyze this file: {exc}",
+                    "type": "unreadable",
+                })
 
         return errors

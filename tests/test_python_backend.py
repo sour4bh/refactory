@@ -1414,3 +1414,142 @@ class TestFailureAtomicity:
 
         assert not (temp_python_project / "newpkg" / "helpers.py").exists()
         assert not (temp_python_project / "newpkg" / "__init__.py").exists()
+
+
+class TestSemanticPreflight:
+    """Symbol moves must refuse cases where Rope would silently change behavior."""
+
+    def test_move_symbol_refuses_target_collision(self, python_backend, temp_python_project):
+        """An existing target definition would shadow the moved symbol."""
+        (temp_python_project / "src" / "existing.py").write_text(
+            "def helper_func():\n    return 'target'\n"
+        )
+
+        with pytest.raises(Exception, match="already defines"):
+            python_backend.move_symbol(
+                source_file="src/utils.py",
+                symbol_name="helper_func",
+                target_file="src/existing.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+
+        assert "helper_func" in (temp_python_project / "src" / "utils.py").read_text()
+
+    def test_move_symbol_allows_target_importing_the_symbol(self, python_backend, temp_python_project):
+        """An import of the moved symbol from the source is not a collision -
+        Rope replaces the import with the definition."""
+        (temp_python_project / "src" / "landing.py").write_text(
+            "from src.utils import helper_func\n\n\ndef wrapper():\n    return helper_func()\n"
+        )
+
+        result = python_backend.move_symbol(
+            source_file="src/utils.py",
+            symbol_name="helper_func",
+            target_file="src/landing.py",
+            project_root=str(temp_python_project),
+            dry_run=False,
+        )
+
+        assert result["success"]
+        assert "def helper_func" in (temp_python_project / "src" / "landing.py").read_text()
+
+    def test_move_symbol_refuses_lazy_package_submodule_import(self, python_backend, tmp_path):
+        """A function-local 'from pkg import worker' used as worker.task() must refuse
+        moving task out of worker.py, because Rope hoists the rewritten import."""
+        project = tmp_path / "proj"
+        (project / "pkg").mkdir(parents=True)
+        (project / "pkg" / "__init__.py").write_text("")
+        (project / "pkg" / "worker.py").write_text("def task():\n    return 1\n")
+        (project / "consumer.py").write_text(
+            "def use():\n"
+            "    from pkg import worker\n"
+            "    return worker.task()\n"
+        )
+
+        with pytest.raises(Exception, match="lazy"):
+            python_backend.move_symbol(
+                source_file="pkg/worker.py",
+                symbol_name="task",
+                target_file="pkg/other.py",
+                project_root=str(project),
+                dry_run=False,
+            )
+
+        assert "def task" in (project / "pkg" / "worker.py").read_text()
+
+
+class TestValidateImportsSafety:
+    """validate_imports must stay read-only and report what it cannot analyze."""
+
+    def test_does_not_execute_package_init(self, python_backend, tmp_path, monkeypatch):
+        """Resolving pkg.sub must not run pkg/__init__.py."""
+        site = tmp_path / "site"
+        package = site / "sidepkg_refactory_probe"
+        package.mkdir(parents=True)
+        package.joinpath("__init__.py").write_text(
+            "from pathlib import Path\n"
+            "Path(__file__).parent.joinpath('MARKER').write_text('ran')\n"
+        )
+        package.joinpath("sub.py").write_text("VALUE = 1\n")
+        monkeypatch.syspath_prepend(str(site))
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "app.py").write_text("import sidepkg_refactory_probe.sub\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert errors == []
+        assert not package.joinpath("MARKER").exists()
+
+    def test_reads_pep263_encoded_files(self, python_backend, tmp_path):
+        """A latin-1 file with an encoding declaration must be scanned, not skipped."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "legacy.py").write_bytes(
+            "# -*- coding: latin-1 -*-\n# caf\xe9\nimport missing_mod_xyz_refactory\n".encode("latin-1")
+        )
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert any(error.get("import") == "missing_mod_xyz_refactory" for error in errors)
+
+    def test_unreadable_file_is_reported_as_finding(self, python_backend, tmp_path):
+        """A file the scan cannot read must appear in the result, not just a log line."""
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "junk.py").write_bytes(b"\xff\xfe\x00broken import junk\n")
+
+        errors = python_backend.validate_imports(str(project))
+
+        assert any(error.get("type") in {"unreadable", "syntax_error"} for error in errors)
+
+
+class TestWriteFaultTolerance:
+    """A write failure inside one Rope change must restore every touched file."""
+
+    def test_failed_consumer_write_restores_files(self, python_backend, temp_python_project):
+        read_only = temp_python_project / "tests" / "test_utils.py"
+        before = {
+            path: path.read_bytes()
+            for path in sorted(temp_python_project.rglob("*.py"))
+        }
+        read_only.chmod(0o444)
+        try:
+            with pytest.raises(Exception):
+                python_backend.rename_symbol(
+                    file="src/utils.py",
+                    old_name="helper_func",
+                    new_name="helper_fn",
+                    project_root=str(temp_python_project),
+                    dry_run=False,
+                )
+        finally:
+            read_only.chmod(0o644)
+
+        after = {
+            path: path.read_bytes()
+            for path in sorted(temp_python_project.rglob("*.py"))
+        }
+        assert after == before
