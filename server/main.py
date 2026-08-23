@@ -4,6 +4,7 @@ Refactory MCP Server - Token-efficient codebase refactoring tools.
 
 Provides shared cross-language tools plus Python-only Rope extras.
 """
+import asyncio
 import json
 import logging
 import sys
@@ -74,6 +75,8 @@ def require_project_root(arguments: dict[str, Any]) -> str:
     root = Path(project_root).expanduser()
     if not root.is_absolute():
         raise ValueError(f"project_root must be an absolute path: {project_root}")
+    if not root.is_dir():
+        raise ValueError(f"Project root does not exist: {project_root}")
     return str(root)
 
 
@@ -322,119 +325,165 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+MUTATING_TOOLS = frozenset({
+    "move_module",
+    "move_symbol",
+    "rename_symbol",
+    "organize_imports",
+    "extract_variable",
+    "extract_function",
+    "inline_symbol",
+})
+
+# Per-project write serialization. The registry lives for the server process,
+# like the backend singletons; entries are bounded by the distinct project
+# roots a session touches.
+_project_locks: dict[str, asyncio.Lock] = {}
+
+
+def _project_lock(project_root: str) -> asyncio.Lock:
+    lock = _project_locks.get(project_root)
+    if lock is None:
+        lock = _project_locks.setdefault(project_root, asyncio.Lock())
+    return lock
+
+
+def _dispatch_tool(name: str, arguments: dict[str, Any], project_root: str, dry_run: bool) -> dict[str, Any]:
+    """Run one tool synchronously; called from a worker thread."""
+    if name == "move_module":
+        source = arguments["source"]
+        target = arguments["target"]
+        overwrite = arguments.get("overwrite", False)
+        language = detect_language(source)
+        backend = get_backend(language)
+        result = backend.move_module(
+            source,
+            target,
+            project_root,
+            dry_run,
+            overwrite=overwrite,
+        )
+
+    elif name == "move_symbol":
+        source_file = arguments["source_file"]
+        symbol_name = arguments["symbol_name"]
+        target_file = arguments["target_file"]
+        language = detect_language(source_file)
+        backend = get_backend(language)
+        result = backend.move_symbol(
+            source_file,
+            symbol_name,
+            target_file,
+            project_root,
+            dry_run,
+        )
+
+    elif name == "rename_symbol":
+        file = arguments["file"]
+        old_name = arguments["old_name"]
+        new_name = arguments["new_name"]
+        line, column = validate_position_selector(
+            arguments.get("line"),
+            arguments.get("column"),
+        )
+        language = detect_language(file)
+        backend = get_backend(language)
+        result = backend.rename_symbol(
+            file,
+            old_name,
+            new_name,
+            project_root,
+            dry_run,
+            line=line,
+            column=column,
+        )
+
+    elif name == "validate_imports":
+        language = arguments.get("language")
+        results = []
+        languages = [language] if language else list(BACKENDS.keys())
+        for lang in languages:
+            try:
+                lang_result = get_backend(lang).validate_imports(project_root)
+            except Exception as exc:
+                logger.exception(f"{lang} validate_imports failed")
+                results.append({
+                    "language": lang,
+                    "errors": [{
+                        "file": "",
+                        "line": 0,
+                        "error": f"{lang} validation could not run: {exc}",
+                        "type": "backend_error",
+                    }],
+                })
+                continue
+            if lang_result:
+                results.append({"language": lang, "errors": lang_result})
+        result = {"valid": len(results) == 0, "issues": results}
+
+    elif name == "organize_imports":
+        backend = get_backend("python")
+        result = backend.organize_imports(
+            arguments["file"],
+            project_root,
+            dry_run,
+        )
+
+    elif name == "extract_variable":
+        backend = get_backend("python")
+        result = backend.extract_variable(
+            file=arguments["file"],
+            new_name=arguments["new_name"],
+            start_line=arguments["start_line"],
+            start_column=arguments["start_column"],
+            end_line=arguments["end_line"],
+            end_column=arguments["end_column"],
+            project_root=project_root,
+            dry_run=dry_run,
+        )
+
+    elif name == "extract_function":
+        backend = get_backend("python")
+        result = backend.extract_function(
+            file=arguments["file"],
+            new_name=arguments["new_name"],
+            start_line=arguments["start_line"],
+            start_column=arguments["start_column"],
+            end_line=arguments["end_line"],
+            end_column=arguments["end_column"],
+            project_root=project_root,
+            dry_run=dry_run,
+        )
+
+    elif name == "inline_symbol":
+        backend = get_backend("python")
+        result = backend.inline_symbol(
+            file=arguments["file"],
+            line=arguments["line"],
+            column=arguments["column"],
+            project_root=project_root,
+            dry_run=dry_run,
+        )
+
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+
+    return result
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent] | CallToolResult:
-    """Execute a refactoring tool."""
+    """Execute a refactoring tool off the event loop, serializing applies per project."""
     try:
         project_root = require_project_root(arguments)
         apply_changes = arguments.get("apply") is True
         dry_run = not apply_changes
 
-        if name == "move_module":
-            source = arguments["source"]
-            target = arguments["target"]
-            overwrite = arguments.get("overwrite", False)
-            language = detect_language(source)
-            backend = get_backend(language)
-            result = backend.move_module(
-                source,
-                target,
-                project_root,
-                dry_run,
-                overwrite=overwrite,
-            )
-
-        elif name == "move_symbol":
-            source_file = arguments["source_file"]
-            symbol_name = arguments["symbol_name"]
-            target_file = arguments["target_file"]
-            language = detect_language(source_file)
-            backend = get_backend(language)
-            result = backend.move_symbol(
-                source_file,
-                symbol_name,
-                target_file,
-                project_root,
-                dry_run,
-            )
-
-        elif name == "rename_symbol":
-            file = arguments["file"]
-            old_name = arguments["old_name"]
-            new_name = arguments["new_name"]
-            line, column = validate_position_selector(
-                arguments.get("line"),
-                arguments.get("column"),
-            )
-            language = detect_language(file)
-            backend = get_backend(language)
-            result = backend.rename_symbol(
-                file,
-                old_name,
-                new_name,
-                project_root,
-                dry_run,
-                line=line,
-                column=column,
-            )
-
-        elif name == "validate_imports":
-            language = arguments.get("language")
-            results = []
-            languages = [language] if language else list(BACKENDS.keys())
-            for lang in languages:
-                backend = get_backend(lang)
-                lang_result = backend.validate_imports(project_root)
-                if lang_result:
-                    results.append({"language": lang, "errors": lang_result})
-            result = {"valid": len(results) == 0, "issues": results}
-
-        elif name == "organize_imports":
-            backend = get_backend("python")
-            result = backend.organize_imports(
-                arguments["file"],
-                project_root,
-                dry_run,
-            )
-
-        elif name == "extract_variable":
-            backend = get_backend("python")
-            result = backend.extract_variable(
-                file=arguments["file"],
-                new_name=arguments["new_name"],
-                start_line=arguments["start_line"],
-                start_column=arguments["start_column"],
-                end_line=arguments["end_line"],
-                end_column=arguments["end_column"],
-                project_root=project_root,
-                dry_run=dry_run,
-            )
-
-        elif name == "extract_function":
-            backend = get_backend("python")
-            result = backend.extract_function(
-                file=arguments["file"],
-                new_name=arguments["new_name"],
-                start_line=arguments["start_line"],
-                start_column=arguments["start_column"],
-                end_line=arguments["end_line"],
-                end_column=arguments["end_column"],
-                project_root=project_root,
-                dry_run=dry_run,
-            )
-
-        elif name == "inline_symbol":
-            backend = get_backend("python")
-            result = backend.inline_symbol(
-                file=arguments["file"],
-                line=arguments["line"],
-                column=arguments["column"],
-                project_root=project_root,
-                dry_run=dry_run,
-            )
-
+        if name in MUTATING_TOOLS and apply_changes:
+            async with _project_lock(project_root):
+                result = await asyncio.to_thread(_dispatch_tool, name, arguments, project_root, dry_run)
         else:
-            raise ValueError(f"Unknown tool: {name}")
+            result = await asyncio.to_thread(_dispatch_tool, name, arguments, project_root, dry_run)
 
         if name != "validate_imports":
             result = format_apply_result(result, apply_changes)
@@ -456,5 +505,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())

@@ -363,3 +363,30 @@ class TestApplyMode:
         assert data["apply"] is False
         assert (temp_python_project / "src" / "db.py").exists()
         assert not (temp_python_project / "src" / "storage").exists()
+
+
+class TestValidationBoundary:
+    """One backend failing must not discard the other language's findings."""
+
+    @pytest.mark.asyncio
+    async def test_validate_keeps_python_findings_when_typescript_fails(self, tmp_path):
+        from main import call_tool
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "app.py").write_text("import missing_mod_boundary_probe\n")
+        (project / "tsconfig.json").write_text("{not valid json")
+
+        result = await call_tool("validate_imports", {"project_root": str(project)})
+
+        data = json.loads(result[0].text)
+        assert not data["valid"]
+        by_language = {issue["language"]: issue["errors"] for issue in data["issues"]}
+        assert any(
+            error.get("import") == "missing_mod_boundary_probe"
+            for error in by_language.get("python", [])
+        )
+        assert any(
+            error.get("type") == "backend_error"
+            for error in by_language.get("typescript", [])
+        )
