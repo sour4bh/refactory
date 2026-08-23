@@ -50,6 +50,9 @@ TS_RESERVED_WORDS = {
     "while",
     "with",
     "yield",
+    # Not keywords, but invalid as binding names in strict mode (TS1100/TS1215).
+    "arguments",
+    "eval",
 }
 
 
@@ -60,6 +63,8 @@ def validate_identifier(name: str, language: str) -> None:
             raise ValueError(f"Invalid Python identifier: {name!r}")
         if keyword.iskeyword(name):
             raise ValueError(f"Invalid Python identifier: {name!r}")
+        if name == "__debug__":
+            raise ValueError("Invalid Python identifier: '__debug__' cannot be assigned")
         return
 
     if language == "typescript":

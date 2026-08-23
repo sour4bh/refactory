@@ -1,6 +1,7 @@
 """TypeScript refactoring backend using ts-morph via subprocess."""
 import json
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -44,8 +45,39 @@ class TypeScriptBackend:
             )
         return None
 
+    def _install_dependencies(self) -> str | None:
+        """Install ts-morph on demand; return an error string if still unavailable.
+
+        Every plugin version update lands in a fresh cache directory without
+        node_modules, and the SessionStart install hook cannot fire
+        mid-session, so the backend installs on first use instead of
+        instructing the user to.
+        """
+        if not TSMORPH_SCRIPT.exists():
+            return self._dependency_error
+        manager = shutil.which("pnpm") or shutil.which("npm")
+        if manager is None:
+            return f"{self._dependency_error} (neither pnpm nor npm is on PATH)"
+        logger.info("ts-morph missing; running %s install in %s", manager, TSMORPH_DIR)
+        try:
+            proc = subprocess.run(
+                [manager, "install"],
+                cwd=str(TSMORPH_DIR),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"{self._dependency_error} (automatic install failed: {exc})"
+        if proc.returncode != 0 or not TSMORPH_MODULE_MARKER.exists():
+            detail = proc.stderr.strip().splitlines()[-1:] or ["unknown installer error"]
+            return f"{self._dependency_error} (automatic install failed: {detail[0]})"
+        return None
+
     def _run_tsmorph(self, operation: str, args: dict[str, Any]) -> dict[str, Any]:
         """Run ts-morph refactoring script."""
+        if self._dependency_error is not None:
+            self._dependency_error = self._install_dependencies()
         if self._dependency_error is not None:
             raise RuntimeError(self._dependency_error)
 
