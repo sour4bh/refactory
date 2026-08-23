@@ -920,6 +920,12 @@ function moveModule(args) {
   if (fs.existsSync(targetPath) && targetPath !== sourcePath && !overwrite) {
     throw new Error(`target already exists: ${target}`);
   }
+  if (!fs.existsSync(sourcePath) || !fs.statSync(sourcePath).isFile()) {
+    throw new Error(`source file not found: ${source}`);
+  }
+  if (fs.existsSync(targetPath) && targetPath !== sourcePath && !fs.statSync(targetPath).isFile()) {
+    throw new Error(`target exists but is not a regular file: ${target}`);
+  }
 
   const project = getProject(projectRoot);
   const root = path.resolve(projectRoot);

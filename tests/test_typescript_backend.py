@@ -1022,3 +1022,45 @@ class TestWorkspaceScope:
         )
 
         assert result["warnings"] == []
+
+
+class TestMoveModuleFailureSafety:
+    """A refused move must not delete or change anything on disk."""
+
+    def test_missing_source_keeps_existing_target(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """A move with a missing source must not delete the overwrite target."""
+        target = temp_typescript_project / "src" / "db.ts"
+        original = target.read_text()
+
+        with pytest.raises(Exception, match="source file not found"):
+            typescript_backend.move_module(
+                source="src/missing.ts",
+                target="src/db.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+                overwrite=True,
+            )
+
+        assert target.read_text() == original
+
+    def test_overwrite_rejects_directory_target(
+        self, typescript_backend, temp_typescript_project
+    ):
+        """A directory whose name ends in .ts must not be an overwrite target."""
+        dir_target = temp_typescript_project / "src" / "legacy.ts"
+        dir_target.mkdir()
+        (dir_target / "keep.txt").write_text("keep")
+
+        with pytest.raises(Exception, match="not a regular file"):
+            typescript_backend.move_module(
+                source="src/db.ts",
+                target="src/legacy.ts",
+                project_root=str(temp_typescript_project),
+                dry_run=False,
+                overwrite=True,
+            )
+
+        assert (dir_target / "keep.txt").read_text() == "keep"
+        assert (temp_typescript_project / "src" / "db.ts").exists()

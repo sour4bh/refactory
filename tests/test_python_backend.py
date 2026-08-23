@@ -1357,3 +1357,60 @@ class TestValidateImportsScope:
         errors = python_backend.validate_imports(str(project))
 
         assert any("consumer.py" in error.get("file", "") for error in errors)
+
+
+class TestFailureAtomicity:
+    """A failed or refused operation must leave the project exactly as it was."""
+
+    def test_overwrite_rejects_directory_target(self, python_backend, temp_python_project):
+        """A directory whose name ends in .py must not be deleted by overwrite."""
+        dir_target = temp_python_project / "dst" / "same.py"
+        dir_target.mkdir(parents=True)
+        (dir_target / "keep.txt").write_text("keep")
+
+        with pytest.raises(Exception, match="not a regular file"):
+            python_backend.move_module(
+                source="src/utils.py",
+                target="dst/same.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+                overwrite=True,
+            )
+
+        assert (dir_target / "keep.txt").read_text() == "keep"
+        assert (temp_python_project / "src" / "utils.py").exists()
+        assert not (temp_python_project / "dst" / "__init__.py").exists()
+
+    def test_failed_late_rename_rolls_back_everything(self, python_backend, temp_python_project):
+        """Rope rejects 'class' as a module name only after the package scaffold and
+        the intermediate move already ran; the failure must undo both."""
+        source = temp_python_project / "src" / "utils.py"
+        source_text = source.read_text()
+        main_text = (temp_python_project / "src" / "main.py").read_text()
+
+        with pytest.raises(Exception):
+            python_backend.move_module(
+                source="src/utils.py",
+                target="pkg/class.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+
+        assert source.read_text() == source_text
+        assert (temp_python_project / "src" / "main.py").read_text() == main_text
+        assert not (temp_python_project / "pkg" / "__init__.py").exists()
+        assert not (temp_python_project / "pkg" / "utils.py").exists()
+
+    def test_move_symbol_failure_rolls_back_scaffold(self, python_backend, temp_python_project):
+        """A move_symbol that fails after staging the target must remove the scaffold."""
+        with pytest.raises(Exception):
+            python_backend.move_symbol(
+                source_file="src/utils.py",
+                symbol_name="does_not_exist",
+                target_file="newpkg/helpers.py",
+                project_root=str(temp_python_project),
+                dry_run=False,
+            )
+
+        assert not (temp_python_project / "newpkg" / "helpers.py").exists()
+        assert not (temp_python_project / "newpkg" / "__init__.py").exists()

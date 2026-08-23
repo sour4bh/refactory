@@ -37,6 +37,19 @@ SCAN_SKIP_DIR_NAMES = frozenset({
 })
 
 
+class _AppliedChanges:
+    """Count of Rope changes already applied to disk.
+
+    The operation entry point owns one of these and passes it into every
+    helper that can apply changes. _do updates the count immediately after
+    each apply, so the entry point can undo every applied change even when
+    a helper raises between applying and returning.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+
 class PythonBackend:
     """Python refactoring using Rope library."""
 
@@ -320,16 +333,16 @@ class PythonBackend:
         root: Path,
         folder_path: Path,
         apply_staging: bool,
-    ) -> tuple[Any, list[str], list[str], int]:
+        txn: _AppliedChanges,
+    ) -> tuple[Any, list[str], list[str]]:
         """Ensure a folder path exists as a Python package using Rope changes."""
         if folder_path == root:
-            return project.root, [], [], 0
+            return project.root, [], []
 
         current = project.root
         current_rel = Path()
         created_init_paths: list[str] = []
         preview_parts: list[str] = []
-        applied_count = 0
 
         for part in folder_path.relative_to(root).parts:
             child_rel = (current_rel / part).as_posix()
@@ -342,8 +355,7 @@ class PythonBackend:
                 change = CreateFolder(current, part)
                 preview_parts.append(change.get_description())
                 if apply_staging:
-                    self._do(project, root, change)
-                    applied_count += 1
+                    self._do(project, root, change, txn)
                     child = project.get_resource(child_rel)
                 else:
                     child = project.get_folder(child_rel)
@@ -358,14 +370,13 @@ class PythonBackend:
                 change = CreateFile(child, "__init__.py")
                 preview_parts.append(change.get_description())
                 if apply_staging:
-                    self._do(project, root, change)
-                    applied_count += 1
+                    self._do(project, root, change, txn)
                 created_init_paths.append(init_rel)
 
             current = child
             current_rel = Path(child_rel)
 
-        return current, created_init_paths, preview_parts, applied_count
+        return current, created_init_paths, preview_parts
 
     def _stage_file_resource(
         self,
@@ -373,13 +384,15 @@ class PythonBackend:
         root: Path,
         file_path: Path,
         apply_staging: bool,
-    ) -> tuple[Any, list[str], list[str], int]:
+        txn: _AppliedChanges,
+    ) -> tuple[Any, list[str], list[str]]:
         """Ensure a file resource exists using Rope changes."""
-        folder_resource, created_inits, preview_parts, applied_count = self._stage_package_structure(
+        folder_resource, created_inits, preview_parts = self._stage_package_structure(
             project,
             root,
             file_path.parent,
             apply_staging,
+            txn,
         )
         rel_path = self._relative_path(file_path, root)
         if file_path.exists():
@@ -390,12 +403,11 @@ class PythonBackend:
             change = CreateFile(folder_resource, file_path.name)
             preview_parts.append(change.get_description())
             if apply_staging:
-                self._do(project, root, change)
-                applied_count += 1
+                self._do(project, root, change, txn)
                 resource = project.get_resource(rel_path)
             else:
                 resource = project.get_file(rel_path)
-        return resource, created_inits, preview_parts, applied_count
+        return resource, created_inits, preview_parts
 
     def _stage_remove_existing_target(
         self,
@@ -403,18 +415,25 @@ class PythonBackend:
         root: Path,
         target_path: Path,
         apply_staging: bool,
-    ) -> tuple[list[str], int]:
-        """Remove an existing target resource using Rope changes."""
+        txn: _AppliedChanges,
+    ) -> list[str]:
+        """Remove an existing target file using Rope changes.
+
+        Only a regular file may be replaced: the overwrite flag authorizes
+        replacing one module, never recursively deleting a directory whose
+        name happens to end in .py.
+        """
         rel_path = self._relative_path(target_path, root)
+        if not target_path.is_file():
+            raise ValueError(f"target exists but is not a regular file: {rel_path}")
         try:
             resource = project.get_resource(rel_path)
         except Exception:
-            return [], 0
+            return []
         change = RemoveResource(resource)
         if apply_staging:
-            self._do(project, root, change)
-            return [change.get_description()], 1
-        return [change.get_description()], 0
+            self._do(project, root, change, txn)
+        return [change.get_description()]
 
     def _resource_path(self, project, resource: Any) -> Path:
         path = getattr(resource, "path", "")
@@ -437,9 +456,10 @@ class PythonBackend:
                 f"{formatted}"
             )
 
-    def _do(self, project, root: Path, change: Any) -> None:
+    def _do(self, project, root: Path, change: Any, txn: _AppliedChanges) -> None:
         self._assert_change_inside_project_root(project, root, change)
         project.do(change)
+        txn.count += 1
 
     def _collect_changed_python_files(self, *changes: Any) -> list[str]:
         """Collect changed Python files from Rope Change objects."""
@@ -476,7 +496,8 @@ class PythonBackend:
         target: str,
         overwrite: bool,
         apply_staging: bool,
-    ) -> tuple[Any, Any | None, list[str], list[str], int]:
+        txn: _AppliedChanges,
+    ) -> tuple[Any, Any | None, list[str], list[str]]:
         """Prepare Rope changes for moving a module."""
         source_path = self._validate_source_path(source, str(root))
         target_path = self._validate_path(target, str(root))
@@ -486,28 +507,26 @@ class PythonBackend:
         if target_path.exists() and target_path != source_path and not overwrite:
             raise ValueError(f"target already exists: {target}")
 
-        applied_count = 0
         preview_parts: list[str] = []
         created_init_paths: list[str] = []
 
-        target_folder_resource, created_init_paths, scaffold_preview, scaffold_applied = self._stage_package_structure(
+        target_folder_resource, created_init_paths, scaffold_preview = self._stage_package_structure(
             project,
             root,
             target_path.parent,
             apply_staging,
+            txn,
         )
         preview_parts.extend(scaffold_preview)
-        applied_count += scaffold_applied
 
         if overwrite and target_path.exists() and target_path != source_path:
-            remove_preview, remove_applied = self._stage_remove_existing_target(
+            preview_parts.extend(self._stage_remove_existing_target(
                 project,
                 root,
                 target_path,
                 apply_staging,
-            )
-            preview_parts.extend(remove_preview)
-            applied_count += remove_applied
+                txn,
+            ))
 
         source_resource = self._resource_for_existing_path(project, source_path)
         mover = MoveModule(project, source_resource)
@@ -517,8 +536,7 @@ class PythonBackend:
         rename_changes = None
         if source_path.stem != target_path.stem:
             if apply_staging:
-                self._do(project, root, move_changes)
-                applied_count += 1
+                self._do(project, root, move_changes, txn)
                 moved_rel = self._relative_path(target_path.parent / f"{source_path.stem}.py", root)
                 moved_resource = project.get_resource(moved_rel)
                 renamer = Rename(project, moved_resource, None)
@@ -529,7 +547,7 @@ class PythonBackend:
                     f"Rename moved module from {source_path.stem}.py to {target_path.name}"
                 )
 
-        return move_changes, rename_changes, created_init_paths, preview_parts, applied_count
+        return move_changes, rename_changes, created_init_paths, preview_parts
 
     def _module_parts_for_file(self, py_file: Path, root: Path) -> list[str]:
         """Get the dotted module path for a file relative to the project root."""
@@ -1173,15 +1191,16 @@ class PythonBackend:
         source_path = self._validate_source_path(source, str(root))
         self._check_rope_hazards(source_path, root, "move_module")
         project = self._get_project(str(root))
-        applied_count = 0
+        txn = _AppliedChanges()
         try:
-            move_changes, rename_changes, created_init_paths, preview_parts, applied_count = self._move_module_changes(
+            move_changes, rename_changes, created_init_paths, preview_parts = self._move_module_changes(
                 project,
                 root,
                 source,
                 target,
                 overwrite,
                 not dry_run,
+                txn,
             )
             affected_files = self._merge_paths(
                 self._collect_changed_python_files(move_changes, rename_changes),
@@ -1201,19 +1220,17 @@ class PythonBackend:
                 return result
 
             if rename_changes is None:
-                self._do(project, root, move_changes)
-                applied_count += 1
+                self._do(project, root, move_changes, txn)
             if rename_changes is not None:
-                self._do(project, root, rename_changes)
-                applied_count += 1
+                self._do(project, root, rename_changes, txn)
             return result
         except Exception:
-            if not dry_run and applied_count:
-                self._undo(project, applied_count)
+            if not dry_run and txn.count:
+                self._undo(project, txn.count)
             raise
         finally:
-            if dry_run and applied_count:
-                self._undo(project, applied_count)
+            if dry_run and txn.count:
+                self._undo(project, txn.count)
             project.close()
 
     def move_symbol(
@@ -1248,13 +1265,14 @@ class PythonBackend:
         )
 
         project = self._get_project(str(root))
-        applied_count = 0
+        txn = _AppliedChanges()
         try:
-            target_resource, created_init_paths, preview_parts, applied_count = self._stage_file_resource(
+            target_resource, created_init_paths, preview_parts = self._stage_file_resource(
                 project,
                 root,
                 target_path,
                 not dry_run,
+                txn,
             )
             source_resource = self._resource_for_existing_path(project, source_path)
             source_code = source_resource.read()
@@ -1279,16 +1297,15 @@ class PythonBackend:
                 result["preview"] = self._preview_text(*preview_parts, changes.get_description())
                 return result
 
-            self._do(project, root, changes)
-            applied_count += 1
+            self._do(project, root, changes, txn)
             return result
         except Exception:
-            if not dry_run and applied_count:
-                self._undo(project, applied_count)
+            if not dry_run and txn.count:
+                self._undo(project, txn.count)
             raise
         finally:
-            if dry_run and applied_count:
-                self._undo(project, applied_count)
+            if dry_run and txn.count:
+                self._undo(project, txn.count)
             project.close()
 
     def rename_symbol(
@@ -1336,7 +1353,7 @@ class PythonBackend:
                 result["preview"] = changes.get_description()
                 return result
 
-            self._do(project, root, changes)
+            self._do(project, root, changes, _AppliedChanges())
             return result
         finally:
             project.close()
@@ -1364,7 +1381,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            self._do(project, root, changes)
+            self._do(project, root, changes, _AppliedChanges())
             return result
         finally:
             project.close()
@@ -1408,7 +1425,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            self._do(project, root, changes)
+            self._do(project, root, changes, _AppliedChanges())
             return result
         finally:
             project.close()
@@ -1452,7 +1469,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            self._do(project, root, changes)
+            self._do(project, root, changes, _AppliedChanges())
             return result
         finally:
             project.close()
@@ -1518,7 +1535,7 @@ class PythonBackend:
             if dry_run:
                 result["preview"] = changes.get_description()
                 return result
-            self._do(project, root, changes)
+            self._do(project, root, changes, _AppliedChanges())
             applied = True
             return result
         finally:
