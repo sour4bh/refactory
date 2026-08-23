@@ -54,6 +54,16 @@ async def call_json(session: ClientSession, name: str, arguments: dict[str, obje
     return json.loads(payload.text)
 
 
+async def call_error(session: ClientSession, name: str, arguments: dict[str, object]) -> dict[str, object]:
+    """Call a tool that must fail and decode its structured error payload."""
+    result = await session.call_tool(name, arguments)
+    assert result.isError
+    assert len(result.content) == 1
+    payload = result.content[0]
+    assert payload.type == "text"
+    return json.loads(payload.text)
+
+
 def snapshot_tree(root: Path) -> dict[str, str]:
     """Capture a text snapshot of all files under a fixture tree."""
     snapshot: dict[str, str] = {}
@@ -297,7 +307,7 @@ class TestMcpE2E:
         before = snapshot_tree(project)
 
         async with open_mcp_session() as session:
-            data = await call_json(session, "move_symbol", {
+            data = await call_error(session, "move_symbol", {
                 "source_file": "src/source.ts",
                 "symbol_name": "helper",
                 "target_file": "src/target.ts",
@@ -320,7 +330,7 @@ class TestMcpE2E:
         )
 
         async with open_mcp_session() as session:
-            error_data = await call_json(session, "move_module", {
+            error_data = await call_error(session, "move_module", {
                 "source": "../outside.py",
                 "target": "src/inside.py",
                 "project_root": str(project),

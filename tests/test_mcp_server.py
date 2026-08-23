@@ -9,6 +9,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
 
 
+def _error_payload(result):
+    """Decode the structured error payload from a failed tool call."""
+    assert result.isError
+    assert len(result.content) == 1
+    return json.loads(result.content[0].text)
+
+
 class TestToolListing:
     """Tests for MCP tool listing."""
 
@@ -192,7 +199,7 @@ class TestToolExecution:
 
         result = await call_tool("unknown_tool", {})
 
-        data = json.loads(result[0].text)
+        data = _error_payload(result)
         assert "error" in data
 
 
@@ -240,7 +247,7 @@ class TestErrorHandling:
             "project_root": str(temp_python_project),
         })
 
-        data = json.loads(result[0].text)
+        data = _error_payload(result)
         assert "error" in data
 
     @pytest.mark.asyncio
@@ -253,7 +260,7 @@ class TestErrorHandling:
             "target": "src/storage/db.py",
         })
 
-        data = json.loads(result[0].text)
+        data = _error_payload(result)
         assert "error" in data
         assert "project_root is required" in data["error"]
 
@@ -267,7 +274,7 @@ class TestErrorHandling:
             "language": "python",
         })
 
-        data = json.loads(result[0].text)
+        data = _error_payload(result)
         assert "error" in data
         assert "project_root must be an absolute path" in data["error"]
 
@@ -282,7 +289,7 @@ class TestErrorHandling:
             "project_root": str(temp_python_project),
         })
 
-        data = json.loads(result[0].text)
+        data = _error_payload(result)
         assert "error" in data
 
     @pytest.mark.asyncio
@@ -294,8 +301,8 @@ class TestErrorHandling:
             "project_root": str(tmp_path / "nonexistent"),
         })
 
-        # Should return result (possibly empty) not crash
-        assert len(result) == 1
+        data = _error_payload(result)
+        assert "Project root does not exist" in data["error"]
 
 
 class TestApplyMode:

@@ -12,7 +12,7 @@ from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent
+from mcp.types import CallToolResult, Tool, TextContent
 
 from backends.python import PythonBackend
 from backends.typescript import TypeScriptBackend
@@ -323,7 +323,7 @@ async def list_tools() -> list[Tool]:
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent] | CallToolResult:
     """Execute a refactoring tool."""
     try:
         project_root = require_project_root(arguments)
@@ -443,7 +443,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
     except Exception as e:
         logger.exception(f"Tool {name} failed")
-        return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+        return CallToolResult(
+            isError=True,
+            content=[TextContent(type="text", text=json.dumps({"error": str(e)}))],
+        )
 
 
 async def main():
