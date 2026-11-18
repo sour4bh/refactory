@@ -847,15 +847,30 @@ export function Component() {
 class TestDependencyProbe:
     """The backend should surface an actionable error when ts-morph is missing."""
 
-    def test_backend_reports_missing_ts_morph(self, tmp_path, monkeypatch):
-        """Simulate missing ts-morph by pointing the marker at a nonexistent path."""
+    @pytest.fixture(autouse=True)
+    def isolated_installer(self, tmp_path, monkeypatch):
+        """Record install attempts and keep dependency probes inside the fixture."""
+        import subprocess
+
         from backends import typescript as ts_module
 
-        monkeypatch.setattr(
-            ts_module,
-            "TSMORPH_MODULE_MARKER",
-            tmp_path / "never_exists" / "ts-morph" / "package.json",
-        )
+        engine = tmp_path / "engine"
+        engine.mkdir()
+        (engine / "refactor.js").touch()
+        monkeypatch.setattr(ts_module, "TSMORPH_DIR", engine)
+        monkeypatch.setattr(ts_module, "TSMORPH_SCRIPT", engine / "refactor.js")
+        monkeypatch.setattr(ts_module, "TSMORPH_MODULE_MARKER", engine / "node_modules/ts-morph/package.json")
+
+        def fake_install(command, *, cwd, **options):
+            assert Path(cwd) == engine, f"install attempted outside fixture: {cwd}"
+            return subprocess.CompletedProcess(command, 1, stderr="fixture dependency unavailable")
+
+        monkeypatch.setattr(ts_module.shutil, "which", lambda name: name)
+        monkeypatch.setattr(ts_module.subprocess, "run", fake_install)
+
+    def test_backend_reports_missing_ts_morph(self, tmp_path):
+        """Surface a missing package from the isolated installation fixture."""
+        from backends import typescript as ts_module
 
         backend = ts_module.TypeScriptBackend()
         with pytest.raises(RuntimeError) as info:
@@ -893,12 +908,6 @@ class TestDependencyProbe:
         """The dependency check should be cached on the instance, not re-stat per call."""
         from backends import typescript as ts_module
 
-        monkeypatch.setattr(
-            ts_module,
-            "TSMORPH_MODULE_MARKER",
-            tmp_path / "never_exists" / "ts-morph" / "package.json",
-        )
-
         backend = ts_module.TypeScriptBackend()
         call_count = {"n": 0}
         original = ts_module.TypeScriptBackend._check_dependencies
@@ -924,7 +933,7 @@ class TestDependencyProbe:
 
 
 class TestWorkspaceScope:
-    """Crawl exclusions and the warning for refactoring one workspace package."""
+    """Crawl exclusions and member-root workspace operations."""
 
     @staticmethod
     def _write_package(root: Path, *, tsconfig: bool = True) -> None:
@@ -959,30 +968,31 @@ class TestWorkspaceScope:
         assert not any(".next" in name for name in result["affected_files"])
         assert "handler" in (project / ".next" / "leaked.ts").read_text()
 
-    def test_warns_when_renaming_an_export_inside_a_workspace_package(
-        self, typescript_backend, tmp_path
-    ):
-        """Sibling packages are outside the scan, so silence would be misleading."""
+    def test_rename_updates_siblings_in_a_declared_workspace(self, typescript_backend, tmp_path):
+        """A package-root operation reaches sibling importers in a pnpm workspace."""
         workspace = tmp_path / "monorepo"
         workspace.mkdir()
         (workspace / "pnpm-workspace.yaml").write_text('packages:\n  - "packages/*"\n')
         package = workspace / "packages" / "contracts"
         self._write_package(package)
+        (package / "package.json").write_text('{"name":"@acme/contracts","exports":{"./api":"./src/api.ts"}}')
+        sibling = workspace / "packages" / "app"
+        sibling.mkdir()
+        (sibling / "package.json").write_text('{"name":"@acme/app"}')
+        consumer = sibling / "main.ts"
+        consumer.write_text('import {handler} from "@acme/contracts/api";\nhandler();\n')
 
         result = typescript_backend.rename_symbol(
             file="src/api.ts",
             old_name="handler",
             new_name="handleRequest",
             project_root=str(package),
-            dry_run=True,
+            dry_run=False,
         )
 
         assert result["success"] is True
-        assert len(result["warnings"]) == 1
-        warning = result["warnings"][0]
-        assert str(workspace) in warning
-        assert "handler" in warning
-        assert "NOT updated" in warning
+        assert result["warnings"] == []
+        assert "handleRequest();" in consumer.read_text()
 
     def test_no_warning_for_a_standalone_project(self, typescript_backend, tmp_path):
         """Without a workspace above it, the scan is already complete."""
@@ -1099,7 +1109,7 @@ class TestTransactionalWrites:
         project = tmp_path / "tsproject"
         project.mkdir()
         (project / "tsconfig.json").write_text(
-            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true},"include":["**/*.ts"]}'
+            '{"compilerOptions":{"target":"ES2020","module":"commonjs","strict":true,"outDir":"dist"},"include":["**/*.ts"]}'
         )
         (project / "src").mkdir()
         (project / "src" / "utils.ts").write_text(

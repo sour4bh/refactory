@@ -1,6 +1,7 @@
 """TypeScript refactoring backend using ts-morph via subprocess."""
 import json
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -23,13 +24,7 @@ class TypeScriptBackend:
 
     @staticmethod
     def _check_dependencies() -> str | None:
-        """Return an actionable error string when ts-morph is unavailable, else None.
-
-        Cached on the backend instance so we do not stat the filesystem on every
-        tool call. If ts-morph is installed but broken at runtime, the subprocess
-        will still surface the underlying node error — this probe only catches
-        the common case of "the install hook never ran."
-        """
+        """Check for the engine and its pinned dependencies."""
         if not TSMORPH_SCRIPT.exists():
             return (
                 f"ts-morph script not found at {TSMORPH_SCRIPT}. "
@@ -43,25 +38,34 @@ class TypeScriptBackend:
                 f"(or: npm install). The SessionStart hook normally handles this "
                 f"automatically; run it manually if the hook did not fire."
             )
+        dependencies = json.loads((TSMORPH_DIR / "package.json").read_text())["dependencies"]
+        for name, required in dependencies.items():
+            manifest = TSMORPH_DIR / "node_modules" / name / "package.json"
+            try:
+                installed = json.loads(manifest.read_text())["version"]
+            except (OSError, ValueError, KeyError):
+                installed = None
+            if installed != required:
+                return f"{name}@{required} is required; run npm install or pnpm install in {TSMORPH_DIR}"
         return None
 
     def _install_dependencies(self) -> str | None:
-        """Install ts-morph on demand; return an error string if still unavailable.
-
-        Every plugin version update lands in a fresh cache directory without
-        node_modules, and the SessionStart install hook cannot fire
-        mid-session, so the backend installs on first use instead of
-        instructing the user to.
-        """
+        """Install missing or stale engine dependencies on demand."""
         if not TSMORPH_SCRIPT.exists():
             return self._dependency_error
-        manager = shutil.which("pnpm") or shutil.which("npm")
+        modules = TSMORPH_DIR / "node_modules"
+        prefer_npm = (modules / ".package-lock.json").is_file() and not (modules / ".pnpm").is_dir()
+        managers = ("npm", "pnpm") if prefer_npm else ("pnpm", "npm")
+        manager = shutil.which(managers[0]) or shutil.which(managers[1])
         if manager is None:
             return f"{self._dependency_error} (neither pnpm nor npm is on PATH)"
         logger.info("ts-morph missing; running %s install in %s", manager, TSMORPH_DIR)
         try:
+            command = [manager, "install"]
+            if Path(manager).name in {"npm", "npm.cmd"}:
+                command += ["--no-package-lock", "--no-audit", "--no-fund"]
             proc = subprocess.run(
-                [manager, "install"],
+                command,
                 cwd=str(TSMORPH_DIR),
                 capture_output=True,
                 text=True,
@@ -72,7 +76,7 @@ class TypeScriptBackend:
         if proc.returncode != 0 or not TSMORPH_MODULE_MARKER.exists():
             detail = proc.stderr.strip().splitlines()[-1:] or ["unknown installer error"]
             return f"{self._dependency_error} (automatic install failed: {detail[0]})"
-        return None
+        return self._check_dependencies()
 
     def _run_tsmorph(self, operation: str, args: dict[str, Any]) -> dict[str, Any]:
         """Run ts-morph refactoring script."""
@@ -81,19 +85,48 @@ class TypeScriptBackend:
         if self._dependency_error is not None:
             raise RuntimeError(self._dependency_error)
 
-        cmd = [
-            "node",
-            str(TSMORPH_SCRIPT),
-            operation,
-            json.dumps(args),
-        ]
+        try:
+            timeout = int(os.environ.get("REFACTORY_TIMEOUT_SECONDS", "120"))
+            if timeout < 1:
+                raise ValueError
+        except ValueError:
+            raise ValueError("REFACTORY_TIMEOUT_SECONDS must be a positive integer") from None
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        with subprocess.Popen(
+            ["node", str(TSMORPH_SCRIPT), operation, "-"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        ) as process:
+            try:
+                stdout, stderr = process.communicate(json.dumps(args), timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                process.terminate()
+                stdout, stderr = process.communicate()
+                if process.returncode and not stdout and not stderr:
+                    raise RuntimeError(f"{operation} timed out after {timeout} seconds (REFACTORY_TIMEOUT_SECONDS)") from exc
 
-        if result.returncode != 0:
-            raise RuntimeError(f"ts-morph failed: {result.stderr}")
+        if process.returncode != 0:
+            detail = stderr.strip()
+            try:
+                message = json.loads(detail)["error"]
+            except (ValueError, KeyError, TypeError):
+                message = detail or f"node exited with status {process.returncode}"
+            raise RuntimeError(message)
 
-        return json.loads(result.stdout)
+        return json.loads(stdout)
+
+    def run_operation(
+        self,
+        operation: str,
+        arguments: dict[str, Any],
+        project_root: str,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        """Run a TypeScript workspace operation with the MCP field names."""
+        return self._run_tsmorph(operation, {
+            **arguments,
+            "project_root": self._prepare_project_root(project_root),
+            "apply": not dry_run,
+        })
 
     def _prepare_project_root(self, project_root: str) -> str:
         """Resolve an explicit absolute project_root."""

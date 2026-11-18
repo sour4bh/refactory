@@ -18,8 +18,11 @@ fi
 
 # Check and install Node dependencies for ts-morph
 TSMORPH_DIR="$PLUGIN_ROOT/server/tsmorph"
-if [ -d "$TSMORPH_DIR" ] && [ ! -d "$TSMORPH_DIR/node_modules" ]; then
-    if command -v pnpm &>/dev/null; then
+if [ -d "$TSMORPH_DIR" ] && ! PYTHONPATH="$PLUGIN_ROOT/server" python -c \
+    'from backends.typescript import TypeScriptBackend; raise SystemExit(TypeScriptBackend._check_dependencies() is not None)'; then
+    if [ -f "$TSMORPH_DIR/node_modules/.package-lock.json" ] && [ ! -d "$TSMORPH_DIR/node_modules/.pnpm" ] && command -v npm &>/dev/null; then
+        (cd "$TSMORPH_DIR" && npm install --no-package-lock --silent)
+    elif command -v pnpm &>/dev/null; then
         echo "Installing ts-morph dependencies with pnpm..."
         (cd "$TSMORPH_DIR" && pnpm install --silent)
     elif command -v npm &>/dev/null; then
