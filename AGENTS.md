@@ -14,7 +14,7 @@ The plugin supports both Python (via Rope library) and TypeScript (via ts-morph)
 
 The plugin auto-installs dependencies on first use via the SessionStart hook:
 - Python: `rope`, `mcp`
-- TypeScript: `ts-morph` (requires Node.js and pnpm/npm)
+- TypeScript: `ts-morph` and `diff` (requires Node.js and pnpm/npm)
 
 Manual installation (if needed):
 ```bash
@@ -25,29 +25,16 @@ pip install rope mcp
 cd server/tsmorph && pnpm install
 ```
 
-### Running Tests
+### Running tests
 
 ```bash
-# Run all tests
-./scripts/test.sh
-
-# Run specific test file
-./scripts/test.sh tests/test_python_backend.py
-
-# Run with verbose output
-./scripts/test.sh -v
-
-# Run specific test pattern
-./scripts/test.sh -k "dry_run"
-
-# Python only
-./scripts/test.sh -k "python"
-
-# TypeScript only
-./scripts/test.sh -k "typescript"
+export PATH="$PWD/.venv/bin:$PATH"
+ruff check server tests
+PYTHONPATH="$PWD/server" pytest -q
+PYTHONPATH="$PWD/server" pytest -q -m 'not performance'
 ```
 
-The test suite uses hermetic fixtures (`tests/conftest.py`) that create isolated temporary projects for each test.
+The suite uses isolated fixture projects. `scripts/test.sh` also exercises the installed plugin CLI when available.
 
 ## Architecture
 
@@ -59,31 +46,19 @@ The test suite uses hermetic fixtures (`tests/conftest.py`) that create isolated
 - Handles language detection and validation
 - Returns structured JSON responses
 
-**Language Backends**
-- `server/backends/python.py`: Uses Rope library for Python refactoring
-  - `move_module()`: Move files and update imports
-  - `move_symbol()`: Extract functions/classes to other modules
-  - `rename_symbol()`: Rename identifiers across codebase
-  - `validate_imports()`: Check for import errors
+**Language backends**
 
-- `server/backends/typescript.py`: Wraps ts-morph via subprocess
-  - Calls `server/tsmorph/refactor.js` with JSON arguments
-  - Same four operations as Python backend
-  - Returns structured results
+- `server/backends/python.py` uses Rope for Python operations.
+- `server/backends/typescript.py` sends JSON over stdin to the Node CLI. `REFACTORY_TIMEOUT_SECONDS` configures the default 120-second deadline.
+- `server/workspace_tools.py` defines MCP schemas for shared mutations and the TypeScript workspace tools.
+- `server/tsmorph/refactor.js` normalizes CLI inputs, executes operations in order, and commits the final plan.
+- The workspace resolver reads member manifests and per-member tsconfig options. A session tracks the in-memory files, asset bytes, module reference index and manifest edits. Mutations share this session, including in a batch.
 
-**TypeScript Helper** (`server/tsmorph/refactor.js`)
-- Node.js script using ts-morph library
-- Handles all TypeScript/JavaScript refactoring operations
-- Executes as subprocess from Python backend
+### Tool interface
 
-### Tool Interface (What the Agent Calls)
+MCP requires an absolute `project_root`. The TypeScript CLI accepts the same snake_case fields. Tools preview by default. Use `apply: true` to commit. Loads from a member can update files across its declared workspace. Validate every write path against the workspace boundary and skipped-directory list.
 
-All tools accept:
-- `project_root` (required absolute path)
-- `apply` (optional, defaults to preview mode unless exactly `true`)
-- Language-specific parameters
-
-Tools return structured JSON with operation summary and affected files list.
+TypeScript mutations include `move_module`, `move_symbol`, `rename_symbol`, `delete_module`, `replace_module` and `rewrite_props`. Put ordered operations in a `batch`, or supply a project-relative JSON `payload_file` for a large plan. Each operation reads prior edits. Report errors with the operation index and reject the complete plan on failure.
 
 ### Extensions & Configuration
 
@@ -97,93 +72,19 @@ Tools return structured JSON with operation summary and affected files list.
 **Skills** (`skills/`)
 - `refactoring/SKILL.md`: Knowledge about module organization patterns and refactoring strategies
 
-## Data Flow
+## Implementation and testing
 
-1. The agent calls the MCP tool with file paths and operation parameters
-2. `main.py` detects language from file extension
-3. Backend instantiated and method called with parsed arguments
-4. **Python**: Uses Rope library directly to modify AST and imports
-5. **TypeScript**: Spawns subprocess to run `refactor.js`
-6. Result serialized as JSON and returned to the agent
-7. The agent displays the result or performs follow-up operations
+Use `workspace.js` for per-file tsconfig, package lookup and specifier selection. A public export must exist before writing a cross-package import. Pass the original specifier to preserve alias and extension conventions when moving a file.
 
-## Key Technical Details
+A TypeScript preview and apply must compute the same edits in memory. Include code, assets and manifests in one staged transaction. Check changed source for parser errors before staging. Re-use the operation dispatcher for CLI and MCP calls.
 
-### Path Handling
-- All paths are relative to project root
-- Backends validate that resolved paths stay within project root (security measure)
-- Dry-run mode temporarily creates directories to compute changes without persisting
+Before changing file paths or exports, capture existing reference targets. Verify that untouched references still bind to them before rescanning. Resolve each batch step against the session, including deleted paths. Check package boundaries, export rows and dependency rows of a batch against its final state: `BatchImports` keeps temporary bindings, and the workspace writes dependency rows and their warnings once, after the last step. Recheck resolution config inputs under the write lock.
 
-### Python Backend (Rope)
-- Uses AST parsing to find symbol offsets for move_symbol operations
-- Automatically creates `__init__.py` files in target directories
-- Rope's refactoring engines handle import rewriting
-- Validates symbol existence before operations
+Treat build outputs as read-only resolver inputs. Missing generated entries can still identify a workspace dependency. Keep the per-importer resolution mode when checking a moved specifier. Use member tsconfig patterns to distinguish source directories such as `src/build` from generated or excluded directories. For computed loaders, check finite alternatives and static directory bounds before accepting unbounded sites through `external_computed_files`. List every value that the loader's file writes into a binding that the loader reads. A write that cannot be listed makes the site need an acknowledgment, and the listed values stay checked under it. Scope JSX semantic checks using the import graph, including re-exports and ambient bindings. Measure child-process peak RSS with the declaration-heavy performance fixture.
 
-### TypeScript Backend
-- Communicates via JSON passed through subprocess
-- Parameter names converted to camelCase for JavaScript convention
-- Node process timeout set to 120 seconds
-- ts-morph handles path alias resolution and import rewriting
+Use hermetic pytest fixtures. Give dependency-probe tests a temporary engine directory and a stub installer. Cover both preview and apply, refusal with byte-for-byte preservation, skipped paths, and member-root entry points. Exercise large plans under the `performance` pytest marker.
 
-### Dry-Run Behavior
-- Python: Creates temporary directories, computes changes, then reverts
-- TypeScript: ts-morph script handles dry-run flag
-- Useful for previewing changes before committing
-
-## Testing Strategy
-
-**Test Organization**
-- `tests/test_python_backend.py`: Rope-based operations in isolation
-- `tests/test_typescript_backend.py`: ts-morph via subprocess
-- `tests/test_mcp_server.py`: Tool routing and error handling
-- `tests/conftest.py`: Fixtures that create temporary projects with test files
-
-**Fixture Pattern**
-- Creates isolated `tmp_project` directories for each test
-- Populates with sample Python/TypeScript files
-- Tests can move/rename without affecting other tests
-- Cleanup handled automatically by pytest
-
-**Test Coverage**
-- `move_module`: File relocation with import updates, dry-run mode
-- `move_symbol`: Function/class extraction, circular import detection
-- `rename_symbol`: Identifier renaming across multiple files
-- `validate_imports`: Detection of broken imports
-- Error cases: Invalid paths, missing symbols, escaping project root
-
-## Important Implementation Notes
-
-### Circular Dependencies
-- Python backend includes checks to prevent circular import creation during move_symbol
-- Detected by analyzing import graphs before and after operation
-
-### Path Escaping Protection
-- Both backends validate that paths don't escape project root using `resolve()` and `is_relative_to()`
-- Prevents malicious or accidental path traversal
-
-### Import Rewriting Strategy
-- Python: Rope's refactoring engines automatically update relative and absolute imports
-- TypeScript: ts-morph updates both ES6 and CommonJS import statements
-- Both handle re-exports and barrel files
-
-### Return Format
-All operations return JSON with structure:
-```json
-{
-  "success": true/false,
-  "message": "Human-readable summary",
-  "changedFiles": ["path/to/file.py", "path/to/other.ts"],
-  "preview": "Detailed diff for dry-run mode"
-}
-```
-
-## Known Limitations
-
-- Circular dependencies can prevent some move_symbol operations
-- Path aliases in TypeScript must be properly configured in tsconfig.json
-- Large codebases may be slow due to Rope/ts-morph analysis overhead
-- Dry-run mode requires temporary filesystem modifications
+Python-specific behavior remains in the Rope backend, including circular-import checks, `__init__.py` creation, project path validation and change rollback.
 
 ## References
 

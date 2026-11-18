@@ -86,6 +86,10 @@ class TestMcpE2E:
 
         tools = {tool.name: tool for tool in result.tools}
         assert set(tools) == {
+            "batch",
+            "delete_module",
+            "replace_module",
+            "rewrite_props",
             "move_module",
             "move_symbol",
             "rename_symbol",

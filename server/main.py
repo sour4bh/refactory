@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from mcp.types import CallToolResult, Tool, TextContent
 from backends.python import PythonBackend
 from backends.typescript import TypeScriptBackend
 from validation import validate_position_selector
+from workspace_tools import EXTERNAL_COMPUTED_FILES, TYPESCRIPT_ONLY, workspace_tools
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("refactory")
@@ -35,6 +37,10 @@ EXTENSION_MAP = {
     ".tsx": "typescript",
     ".js": "typescript",
     ".jsx": "typescript",
+    ".mts": "typescript",
+    ".cts": "typescript",
+    ".mjs": "typescript",
+    ".cjs": "typescript",
 }
 
 PREVIEW_MESSAGE = "Preview only. To apply these changes, call the same tool with apply: true."
@@ -84,108 +90,7 @@ def require_project_root(arguments: dict[str, Any]) -> str:
 async def list_tools() -> list[Tool]:
     """List available refactoring tools."""
     return [
-        Tool(
-            name="move_module",
-            description="Move a file/module to a new location and update all imports across the codebase. Supports Python and TypeScript.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Current path of the file to move (relative to project root)",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "New path for the file (relative to project root)",
-                    },
-                    "project_root": {
-                        "type": "string",
-                        "description": "Absolute root directory of the project",
-                    },
-                    "apply": {
-                        "type": "boolean",
-                        "description": "Apply changes to files. Omit or false to preview only.",
-                        "default": False,
-                    },
-                    "overwrite": {
-                        "type": "boolean",
-                        "description": "Overwrite an existing target file if it already exists",
-                        "default": False,
-                    },
-                },
-                "required": ["source", "target", "project_root"],
-            },
-        ),
-        Tool(
-            name="move_symbol",
-            description="Move a function, class, or variable from one module to another and update all references.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "source_file": {
-                        "type": "string",
-                        "description": "File containing the symbol to move",
-                    },
-                    "symbol_name": {
-                        "type": "string",
-                        "description": "Name of the function/class/variable to move",
-                    },
-                    "target_file": {
-                        "type": "string",
-                        "description": "Destination file for the symbol",
-                    },
-                    "project_root": {
-                        "type": "string",
-                        "description": "Absolute root directory of the project",
-                    },
-                    "apply": {
-                        "type": "boolean",
-                        "description": "Apply changes to files. Omit or false to preview only.",
-                        "default": False,
-                    },
-                },
-                "required": ["source_file", "symbol_name", "target_file", "project_root"],
-            },
-        ),
-        Tool(
-            name="rename_symbol",
-            description="Rename a function, class, variable, or parameter across the entire codebase.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "file": {
-                        "type": "string",
-                        "description": "File containing the symbol to rename",
-                    },
-                    "old_name": {
-                        "type": "string",
-                        "description": "Current name of the symbol",
-                    },
-                    "new_name": {
-                        "type": "string",
-                        "description": "New name for the symbol",
-                    },
-                    "project_root": {
-                        "type": "string",
-                        "description": "Absolute root directory of the project",
-                    },
-                    "apply": {
-                        "type": "boolean",
-                        "description": "Apply changes to files. Omit or false to preview only.",
-                        "default": False,
-                    },
-                    "line": {
-                        "type": "integer",
-                        "description": "1-based declaration line for disambiguating parameter renames",
-                    },
-                    "column": {
-                        "type": "integer",
-                        "description": "1-based declaration column for disambiguating parameter renames",
-                    },
-                },
-                "required": ["file", "old_name", "new_name", "project_root"],
-            },
-        ),
+        *workspace_tools(),
         Tool(
             name="validate_imports",
             description="Check for refactor-related import and name-resolution errors after restructuring. This is a narrow safety probe, not a full compiler or linter run.",
@@ -201,6 +106,7 @@ async def list_tools() -> list[Tool]:
                         "enum": ["python", "typescript"],
                         "description": "Language to validate (validates all if not specified)",
                     },
+                    "external_computed_files": EXTERNAL_COMPUTED_FILES,
                 },
                 "required": ["project_root"],
             },
@@ -326,6 +232,7 @@ async def list_tools() -> list[Tool]:
 
 
 MUTATING_TOOLS = frozenset({
+    *TYPESCRIPT_ONLY,
     "move_module",
     "move_symbol",
     "rename_symbol",
@@ -335,21 +242,29 @@ MUTATING_TOOLS = frozenset({
     "inline_symbol",
 })
 
-# Per-project write serialization. The registry lives for the server process,
-# like the backend singletons; entries are bounded by the distinct project
-# roots a session touches.
-_project_locks: dict[str, asyncio.Lock] = {}
+# Hold this in the worker thread so a cancelled MCP call cannot release it
+# while Node/Rope is still committing. Sibling member roots can overlap.
+_write_lock = threading.Lock()
 
 
-def _project_lock(project_root: str) -> asyncio.Lock:
-    lock = _project_locks.get(project_root)
-    if lock is None:
-        lock = _project_locks.setdefault(project_root, asyncio.Lock())
-    return lock
+def _dispatch_apply(name: str, arguments: dict[str, Any], project_root: str) -> dict[str, Any]:
+    """Serialize mutations for this server process."""
+    with _write_lock:
+        return _dispatch_tool(name, arguments, project_root, False)
 
 
 def _dispatch_tool(name: str, arguments: dict[str, Any], project_root: str, dry_run: bool) -> dict[str, Any]:
     """Run one tool synchronously; called from a worker thread."""
+    path_field = {"move_module": "source", "move_symbol": "source_file", "rename_symbol": "file"}.get(name)
+    if name in TYPESCRIPT_ONLY or (path_field and Path(arguments[path_field]).suffix.lower() != ".py"):
+        backend = get_backend("typescript")
+        return backend.run_operation(name, arguments, project_root, dry_run)
+    if path_field:
+        unsupported = {"diff", "diff_limit", "export_as", "companions", "external_computed_files",
+                       "fail_on_new_errors"}.intersection(arguments)
+        if unsupported:
+            raise ValueError(f"{', '.join(sorted(unsupported))} not supported for Python files")
+
     if name == "move_module":
         source = arguments["source"]
         target = arguments["target"]
@@ -401,10 +316,21 @@ def _dispatch_tool(name: str, arguments: dict[str, Any], project_root: str, dry_
     elif name == "validate_imports":
         language = arguments.get("language")
         results = []
+        warnings = []
+        accepted = []
+        if language == "python" and "external_computed_files" in arguments:
+            raise ValueError("external_computed_files not supported for Python files")
         languages = [language] if language else list(BACKENDS.keys())
         for lang in languages:
             try:
-                lang_result = get_backend(lang).validate_imports(project_root)
+                backend = get_backend(lang)
+                if lang == "typescript":
+                    report = backend.run_operation("validate_imports", arguments, project_root, True)
+                    warnings.extend(report.get("warnings", []))
+                    accepted = report.get("accepted_computed_imports", [])
+                    lang_result = report["errors"]
+                else:
+                    lang_result = backend.validate_imports(project_root)
             except Exception as exc:
                 logger.exception(f"{lang} validate_imports failed")
                 results.append({
@@ -420,6 +346,10 @@ def _dispatch_tool(name: str, arguments: dict[str, Any], project_root: str, dry_
             if lang_result:
                 results.append({"language": lang, "errors": lang_result})
         result = {"valid": len(results) == 0, "issues": results}
+        if warnings:
+            result["warnings"] = warnings
+        if accepted:
+            result["accepted_computed_imports"] = accepted
 
     elif name == "organize_imports":
         backend = get_backend("python")
@@ -473,15 +403,14 @@ def _dispatch_tool(name: str, arguments: dict[str, Any], project_root: str, dry_
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent] | CallToolResult:
-    """Execute a refactoring tool off the event loop, serializing applies per project."""
+    """Execute a refactoring tool off the event loop, serializing overlapping writes."""
     try:
         project_root = require_project_root(arguments)
         apply_changes = arguments.get("apply") is True
         dry_run = not apply_changes
 
         if name in MUTATING_TOOLS and apply_changes:
-            async with _project_lock(project_root):
-                result = await asyncio.to_thread(_dispatch_tool, name, arguments, project_root, dry_run)
+            result = await asyncio.to_thread(_dispatch_apply, name, arguments, project_root)
         else:
             result = await asyncio.to_thread(_dispatch_tool, name, arguments, project_root, dry_run)
 
